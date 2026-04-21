@@ -3,8 +3,12 @@ using System;
 [Serializable]
 public class MatchSnapshot
 {
-    public int tick;      // 服务器当前的帧号
-    public float posX;    // 权威 X 坐标
-    public float posY;
+    public int tick;
+    public int lastProcessedSeq;
 
+    public string acceptedState;
+    public bool acceptedGrounded;
+    public int acceptedJumpCount;
+
+    public string rejectReason;
 }

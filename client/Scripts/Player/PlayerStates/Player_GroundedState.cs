@@ -6,20 +6,29 @@ public class Player_GroundedState :PlayerState
     {
     }
 
+    public override void Enter()
+    {
+        base.Enter();
+        player.ResetJumpCount();
+    }
+
     public override void Update()
     {
         base.Update();
+
         if (rb.linearVelocity.y < 0 && player.groundDetected == false)
         {
             stateMachine.ChangeState(player.fallState);
         }
-        if (input.Player.Jump.WasPressedThisFrame())
+
+        if (player.jumpPressedThisFrame && player.CanStartJump())
         {
-            stateMachine.ChangeState(player.jumpState); 
-
+            player.ConsumeJump();
+            stateMachine.ChangeState(player.jumpState);
+            return;
         }
-        if (input.Player.Attack.WasPressedThisFrame())
-            stateMachine.ChangeState(player.basicAttackState);
 
+        if (player.attackPressedThisFrame)
+            stateMachine.ChangeState(player.basicAttackState);
     }
 }

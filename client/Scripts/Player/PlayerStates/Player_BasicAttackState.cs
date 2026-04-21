@@ -38,7 +38,7 @@ public class Player_BasicAttackState :PlayerState
 
 
 
-        if (input.Player.Attack.WasPressedThisFrame())
+        if (player.attackPressedThisFrame)
         {
             QueueNextAttack();
         }

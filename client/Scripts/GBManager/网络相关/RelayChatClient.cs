@@ -215,6 +215,9 @@ public class RelayChatClient : MonoBehaviour
         if (!EnsureSocketOpen())
             return;
 
+        if (!hasJoinedRoom)
+            return;
+
         var msg = new NetMessage
         {
             type = "INPUT",
@@ -264,13 +267,17 @@ public class RelayChatClient : MonoBehaviour
                 var snapshot = JsonUtility.FromJson<MatchSnapshot>(msg.payload);
                 if (debugNetworkLog && snapshot != null)
                 {
-                    Debug.Log($"[{clientId}] APPLY SNAPSHOT tick={snapshot.tick} pos=({snapshot.posX:F2},{snapshot.posY:F2})");
+                    Debug.Log(
+                        $"[{clientId}] APPLY SNAPSHOT tick={snapshot.tick} " +
+                        $"ack={snapshot.lastProcessedSeq} state={snapshot.acceptedState} " +
+                        $"grounded={snapshot.acceptedGrounded} jumpCount={snapshot.acceptedJumpCount}"
+                    );
                 }
                 ClientReceiver.Instance?.OnReceiveSnapshot(snapshot);
                 break;
 
             case "ERROR":
-                Debug.LogError(msg.payload);
+                Debug.LogError($"[{clientId}] SERVER ERROR: {msg.error}");
                 break;
         }
     }

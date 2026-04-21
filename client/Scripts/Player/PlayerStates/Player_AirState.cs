@@ -11,15 +11,22 @@ public class Player_AirState : PlayerState
     {
         base.Update();
 
-        if(player.moveInput.x != 0)
+        if (player.moveInput.x != 0)
         {
             player.SetVelocity(player.moveSpeed * player.moveInput.x * player.inAirMoveMultiplier, rb.linearVelocity.y);
-
         }
-        if(input.Player.Attack.WasPressedThisFrame())
+
+        if (player.jumpPressedThisFrame && player.CanStartJump())
+        {
+            player.ConsumeJump();
+
+            stateMachine.ChangeState(player.jumpState);
+            return;
+        }
+
+        if (player.attackPressedThisFrame)
         {
             stateMachine.ChangeState(player.jumpAttackState);
         }
     }
-
 }
