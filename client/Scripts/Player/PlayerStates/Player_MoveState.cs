@@ -1,4 +1,3 @@
-using PixelCrushers.DialogueSystem.UnityGUI;
 using UnityEngine;
 
 public class Player_MoveState : Player_GroundedState
@@ -7,26 +6,17 @@ public class Player_MoveState : Player_GroundedState
     {
     }
 
-
-    public override void Enter()
-    {
-        base.Enter();
-
-
-    }
-
     public override void Update()
     {
         base.Update();
-        //if (PlayerDirector.nowState == playerDirectorState.move) return;
 
+        if (player.moveInput.x == 0)
+        {
+            stateMachine.ChangeState(player.idleState);
+            return;
+        }
 
-        if (player.moveInput.x == 0 || player.wallDetected ) stateMachine.ChangeState(player.idleState);
-
-
-        player.SetVelocity(player.moveInput.x * player.moveSpeed, rb.linearVelocity.y);
-
+        if (!player.useNetworkControl)
+            player.SetVelocity(player.moveInput.x * player.moveSpeed, rb.linearVelocity.y);
     }
-
-
 }

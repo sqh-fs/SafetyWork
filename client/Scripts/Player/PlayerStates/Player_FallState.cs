@@ -6,14 +6,17 @@ public class Player_FallState : Player_AirState
     {
     }
 
-    public override void Enter()
-    {
-        base.Enter();
-    }
-
     public override void Update()
     {
         base.Update();
+
+        if (player.useNetworkControl)
+        {
+            if (player.GetIsGroundedForNet())
+                stateMachine.ChangeState(player.idleState);
+
+            return;
+        }
 
         if (player.jumpPressedThisFrame && player.CanStartJump())
         {
@@ -22,10 +25,10 @@ public class Player_FallState : Player_AirState
             return;
         }
 
-        if (player.groundDetected == true)
+        if (player.groundDetected)
             stateMachine.ChangeState(player.idleState);
 
-        if (player.wallDetected == true)
+        if (player.wallDetected)
             stateMachine.ChangeState(player.wallSlideState);
     }
 }

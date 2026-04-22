@@ -5,17 +5,8 @@ using NativeWebSocket;
 using UnityEngine;
 
 /// <summary>
-/// 最小可运行 Unity WebSocket 客户端（用于“客户端 -> 服务端 -> 另一客户端”的中转演示）
-///
-/// 依赖库：
-/// - NativeWebSocket
-///
-/// 本脚本支持：
-/// 1. 连接服务器
-/// 2. 发送 JOIN_ROOM
-/// 3. 发送 CHAT
-/// 4. 接收 SERVER_BROADCAST / ERROR
-/// 5. 发送 LEAVE_ROOM
+/// 最小可运行 Unity WebSocket 客户端（带网络模拟器）
+/// 增加：按 ack/tick 丢弃旧快照
 /// </summary>
 public class RelayChatClient : MonoBehaviour
 {
@@ -25,17 +16,27 @@ public class RelayChatClient : MonoBehaviour
     [SerializeField] private string roomId = "demo-room";
     [SerializeField] private bool autoConnect = true;
     [SerializeField] private bool autoJoin = true;
+
+    [Header("调试")]
     [SerializeField] private bool debugNetworkLog = true;
     [SerializeField] private int logEveryNInputs = 10;
+
+    [Header("Network Simulation")]
+    [SerializeField] private bool simulateNetwork = false;   // 先关掉排查
+    [SerializeField] private int outgoingDelayMs = 120;
+    [SerializeField] private int incomingDelayMs = 120;
+    [SerializeField] private int jitterMs = 20;
+    [SerializeField, Range(0f, 1f)] private float outgoingDropRate = 0f;
+    [SerializeField, Range(0f, 1f)] private float incomingDropRate = 0f;
 
     private WebSocket websocket;
     private bool hasJoinedRoom;
     private int sentInputCount;
 
-    /// <summary>
-    /// 统一消息结构（与服务端 JSON 对应）
-    /// 字段尽量覆盖所有消息类型，未使用字段可为空。
-    /// </summary>
+    // 关键：客户端只接受更新的快照
+    private int latestAppliedAck = -1;
+    private int latestAppliedTick = -1;
+
     [Serializable]
     private class NetMessage
     {
@@ -56,11 +57,9 @@ public class RelayChatClient : MonoBehaviour
         {
             _ = Connect();
         }
+        Debug.Log($"[RelayChatClient] Start on {gameObject.name}, clientId={clientId}");
     }
 
-    /// <summary>
-    /// 连接 WebSocket 服务端。
-    /// </summary>
     public async Task Connect()
     {
         if (websocket != null &&
@@ -102,15 +101,10 @@ public class RelayChatClient : MonoBehaviour
         await websocket.Connect();
     }
 
-    /// <summary>
-    /// 向服务端发送 JOIN_ROOM。
-    /// </summary>
     private async Task SendJoinRoom()
     {
         if (!EnsureSocketOpen())
-        {
             return;
-        }
 
         var join = new NetMessage
         {
@@ -119,14 +113,11 @@ public class RelayChatClient : MonoBehaviour
             clientId = clientId
         };
 
-        await SendJson(join);
+        await SendJson(join, bypassSimulation: false);
         hasJoinedRoom = true;
         Debug.Log($"[{clientId}] 已发送 JOIN_ROOM，room={roomId}");
     }
 
-    /// <summary>
-    /// 发送聊天消息到服务端，服务端再转发到另一个客户端。
-    /// </summary>
     public async Task SendChat(string messageText)
     {
         if (string.IsNullOrWhiteSpace(messageText))
@@ -136,9 +127,7 @@ public class RelayChatClient : MonoBehaviour
         }
 
         if (!EnsureSocketOpen())
-        {
             return;
-        }
 
         if (!hasJoinedRoom)
         {
@@ -154,19 +143,14 @@ public class RelayChatClient : MonoBehaviour
             text = messageText
         };
 
-        await SendJson(chat);
+        await SendJson(chat, bypassSimulation: false);
         Debug.Log($"[{clientId}] 已发送 CHAT -> Server: {messageText}");
     }
 
-    /// <summary>
-    /// 离开房间（发送 LEAVE_ROOM）。
-    /// </summary>
     public async Task LeaveRoom()
     {
         if (!EnsureSocketOpen())
-        {
             return;
-        }
 
         if (!hasJoinedRoom)
         {
@@ -181,20 +165,15 @@ public class RelayChatClient : MonoBehaviour
             clientId = clientId
         };
 
-        await SendJson(leave);
+        await SendJson(leave, bypassSimulation: false);
         hasJoinedRoom = false;
         Debug.Log($"[{clientId}] 已发送 LEAVE_ROOM，room={roomId}");
     }
 
-    /// <summary>
-    /// 主动断开 WebSocket 连接。
-    /// </summary>
     public async Task Disconnect()
     {
         if (websocket == null)
-        {
             return;
-        }
 
         if (websocket.State == WebSocketState.Open || websocket.State == WebSocketState.Connecting)
         {
@@ -206,10 +185,6 @@ public class RelayChatClient : MonoBehaviour
         Debug.Log($"[{clientId}] 已执行 Disconnect。");
     }
 
-    /// <summary>
-    /// 统一 JSON 发送入口。
-    /// </summary>
-    /// 
     public async Task SendInput(PlayerInputCmd cmd)
     {
         if (!EnsureSocketOpen())
@@ -232,10 +207,10 @@ public class RelayChatClient : MonoBehaviour
             Debug.Log($"[{clientId}] SEND INPUT #{sentInputCount} seq={cmd.seq} payload={msg.payload}");
         }
 
-        await SendJson(msg);
+        await SendJson(msg, bypassSimulation: false);
     }
 
-    private async Task SendJson(NetMessage message)
+    private async Task SendJson(NetMessage message, bool bypassSimulation)
     {
         if (websocket == null)
         {
@@ -244,13 +219,52 @@ public class RelayChatClient : MonoBehaviour
         }
 
         string json = JsonUtility.ToJson(message);
+
+        if (bypassSimulation || !simulateNetwork)
+        {
+            await SafeSendText(json);
+            return;
+        }
+
+        if (UnityEngine.Random.value < outgoingDropRate)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.LogWarning($"[{clientId}] [NETSIM] OUT DROP type={message.type}");
+            }
+            return;
+        }
+
+        int delay = GetSimulatedDelay(outgoingDelayMs, jitterMs);
+        if (delay > 0)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.Log($"[{clientId}] [NETSIM] OUT delay={delay}ms type={message.type}");
+            }
+            await Task.Delay(delay);
+        }
+
+        await SafeSendText(json);
+    }
+
+    private async Task SafeSendText(string json)
+    {
+        if (websocket == null || websocket.State != WebSocketState.Open)
+        {
+            Debug.LogWarning($"[{clientId}] 发送时 WebSocket 不可用。");
+            return;
+        }
+
         await websocket.SendText(json);
     }
 
-    /// <summary>
-    /// 处理服务端发回的消息，并打印关键日志用于演示。
-    /// </summary>
     private void HandleIncomingMessage(string json)
+    {
+        _ = HandleIncomingMessageAsync(json);
+    }
+
+    private async Task HandleIncomingMessageAsync(string json)
     {
         if (debugNetworkLog)
         {
@@ -264,28 +278,121 @@ public class RelayChatClient : MonoBehaviour
         switch (msg.type)
         {
             case "SNAPSHOT":
-                var snapshot = JsonUtility.FromJson<MatchSnapshot>(msg.payload);
-                if (debugNetworkLog && snapshot != null)
                 {
-                    Debug.Log(
-                        $"[{clientId}] APPLY SNAPSHOT tick={snapshot.tick} " +
-                        $"ack={snapshot.lastProcessedSeq} state={snapshot.acceptedState} " +
-                        $"grounded={snapshot.acceptedGrounded} jumpCount={snapshot.acceptedJumpCount}"
-                    );
+                    var snapshot = JsonUtility.FromJson<MatchSnapshot>(msg.payload);
+                    if (snapshot == null)
+                        return;
+
+                    if (debugNetworkLog)
+                    {
+                        Debug.Log(
+                            $"[{clientId}] SNAPSHOT RAW tick={snapshot.tick} " +
+                            $"ack={snapshot.lastProcessedSeq} state={snapshot.acceptedState} " +
+                            $"grounded={snapshot.acceptedGrounded} jumpCount={snapshot.acceptedJumpCount} " +
+                            $"drop={snapshot.acceptedDrop} pos=({snapshot.serverPosX}, {snapshot.serverPosY}) " +
+                            $"vel=({snapshot.serverVelX}, {snapshot.serverVelY})"
+                        );
+                    }
+
+                    await DispatchSnapshotWithSimulation(snapshot);
+                    break;
                 }
-                ClientReceiver.Instance?.OnReceiveSnapshot(snapshot);
-                break;
+
+            case "SERVER_BROADCAST":
+                {
+                    if (debugNetworkLog)
+                    {
+                        Debug.Log($"[{clientId}] SERVER_BROADCAST from={msg.fromClientId} text={msg.text}");
+                    }
+                    break;
+                }
 
             case "ERROR":
-                Debug.LogError($"[{clientId}] SERVER ERROR: {msg.error}");
-                break;
+                {
+                    Debug.LogError($"[{clientId}] SERVER ERROR: {msg.error}");
+                    break;
+                }
         }
     }
 
+    private async Task DispatchSnapshotWithSimulation(MatchSnapshot snapshot)
+    {
+        if (!simulateNetwork)
+        {
+            ApplySnapshot(snapshot);
+            return;
+        }
 
-    /// <summary>
-    /// 判断 WebSocket 是否处于 Open 状态。
-    /// </summary>
+        if (UnityEngine.Random.value < incomingDropRate)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.LogWarning($"[{clientId}] [NETSIM] IN DROP tick={snapshot.tick}");
+            }
+            return;
+        }
+
+        int delay = GetSimulatedDelay(incomingDelayMs, jitterMs);
+        if (delay > 0)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.Log($"[{clientId}] [NETSIM] IN delay={delay}ms tick={snapshot.tick}");
+            }
+            await Task.Delay(delay);
+        }
+
+        ApplySnapshot(snapshot);
+    }
+
+    private void ApplySnapshot(MatchSnapshot snapshot)
+    {
+        // 关键：按 ack/tick 丢弃旧快照
+        bool isOlder =
+            snapshot.lastProcessedSeq < latestAppliedAck ||
+            (snapshot.lastProcessedSeq == latestAppliedAck && snapshot.tick <= latestAppliedTick);
+
+        if (isOlder)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.LogWarning(
+                    $"[{clientId}] DROP OLD SNAPSHOT tick={snapshot.tick} ack={snapshot.lastProcessedSeq} " +
+                    $"latestTick={latestAppliedTick} latestAck={latestAppliedAck}"
+                );
+            }
+            return;
+        }
+
+        latestAppliedAck = snapshot.lastProcessedSeq;
+        latestAppliedTick = snapshot.tick;
+
+        if (debugNetworkLog)
+        {
+            Debug.Log(
+                $"[{clientId}] APPLY SNAPSHOT tick={snapshot.tick} " +
+                $"ack={snapshot.lastProcessedSeq} state={snapshot.acceptedState} " +
+                $"grounded={snapshot.acceptedGrounded} jumpCount={snapshot.acceptedJumpCount} " +
+                $"drop={snapshot.acceptedDrop} pos=({snapshot.serverPosX}, {snapshot.serverPosY}) " +
+                $"vel=({snapshot.serverVelX}, {snapshot.serverVelY})"
+            );
+        }
+
+        ClientReceiver.Instance?.OnReceiveSnapshot(snapshot);
+    }
+
+    private int GetSimulatedDelay(int baseDelayMs, int jitterRangeMs)
+    {
+        int jitter = 0;
+        if (jitterRangeMs > 0)
+        {
+            jitter = UnityEngine.Random.Range(-jitterRangeMs, jitterRangeMs + 1);
+        }
+
+        int finalDelay = baseDelayMs + jitter;
+        return Mathf.Max(0, finalDelay);
+    }
+
     private bool EnsureSocketOpen()
     {
         if (websocket == null || websocket.State != WebSocketState.Open)
@@ -298,7 +405,6 @@ public class RelayChatClient : MonoBehaviour
 
     private void Update()
     {
-        // NativeWebSocket 官方建议：非 WebGL 平台在 Update 中主动调度消息队列。
 #if !UNITY_WEBGL || UNITY_EDITOR
         websocket?.DispatchMessageQueue();
 #endif
@@ -308,10 +414,6 @@ public class RelayChatClient : MonoBehaviour
     {
         await Disconnect();
     }
-
-    // -----------------------
-    // 下面几个 ContextMenu 仅用于快速演示（可选）
-    // -----------------------
 
     [ContextMenu("Connect")]
     private void ConnectFromMenu()
