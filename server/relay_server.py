@@ -1,88 +1,19 @@
-﻿import asyncio
+import asyncio
 import json
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, List
+from typing import Any, Dict, Optional, Set
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-
-HOST = "0.0.0.0"
-PORT = 8765
-MAX_JUMP_COUNT = 2
-multiplier = 0.2;
-# -----------------------------
-# 简化地图参数
-# -----------------------------
-GROUND_EPSILON = 0.001
-PLAYER_HALF_WIDTH = 0.46
-PLAYER_HALF_HEIGHT = 0.42
-
-# -----------------------------
-# 统一运动参数
-# -----------------------------
-SIM_DT = 0.05      # 建议和 Unity Fixed Timestep 保持一致
-MOVE_SPEED = 16.0 * multiplier    # 建议和 Unity 玩家 moveSpeed 保持一致（单位/秒）
-
-GRAVITY = -2.0 * multiplier
-JUMP_VELOCITY = 30.0 * multiplier
-FALL_SPEED_CAP = -36.0 * multiplier
-OFFSET_Y = 0.7
-GROUND_Y = -1.45 + OFFSET_Y
-
-
-@dataclass
-class Platform:
-    x_min: float
-    x_max: float
-    y: float
-    kind: str  # "solid" | "oneway"
-
-
-@dataclass
-class RectCollider:
-    x_min: float
-    x_max: float
-    y_min: float
-    y_max: float
-    kind: str  # "solid"
-
-
-MAP_PLATFORMS: List[Platform] = [
-    Platform(x_min=-9, x_max=29, y=GROUND_Y, kind="solid"),
-    Platform(x_min=-1.25, x_max=1.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=8.75, x_max=11.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=18.75, x_max=21.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=3.75, x_max=6.25, y=2.5 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=13.75, x_max=16.25, y=2.5 + OFFSET_Y, kind="oneway"),
-]
-
-MAP_WALLS: List[RectCollider] = [
-    RectCollider(x_min=-9.0, x_max=-8.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
-    RectCollider(x_min=29.0, x_max=29.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
-]
-
-
-@dataclass
-class ClientSession:
-    client_id: Optional[str] = None
-    room_id: Optional[str] = None
-
-    last_seq: int = -1
-    accepted_state: str = "Grounded"
-    accepted_grounded: bool = True
-    accepted_jump_count: int = 0
-    accepted_drop: bool = False
-
-    # 简化服务器角色状态
-    pos_x: float = 0.0
-    pos_y: float = GROUND_Y
-    vel_x: float = 0.0
-    vel_y: float = 0.0
+import game_simulation
+from game_config import HOST, JUMP_VELOCITY, MAX_JUMP_COUNT, MOVE_SPEED, PORT, SIM_DT
+from game_models import ClientSession, Platform
 
 
 class RelayServer:
+    """WebSocket 游戏中继服务，负责连接、房间和协议消息处理。"""
+
     def __init__(self, host: str = HOST, port: int = PORT) -> None:
         self.host = host
         self.port = port
@@ -185,21 +116,6 @@ class RelayServer:
         await self.send_json(websocket, ack)
         await self.send_snapshot(websocket, session, "")
 
-    def hits_wall(self, x: float, y: float) -> bool:
-        player_left = x - PLAYER_HALF_WIDTH
-        player_right = x + PLAYER_HALF_WIDTH
-        player_bottom = y
-        player_top = y + PLAYER_HALF_HEIGHT * 2.0
-
-        for wall in MAP_WALLS:
-            overlap_x = player_right > wall.x_min and player_left < wall.x_max
-            overlap_y = player_top > wall.y_min and player_bottom < wall.y_max
-
-            if overlap_x and overlap_y:
-                return True
-
-        return False
-
     async def handle_input(self, websocket: Any, data: Dict[str, Any]) -> None:
         session = self.sessions.get(websocket)
         if session is None or not session.room_id or not session.client_id:
@@ -229,15 +145,13 @@ class RelayServer:
         client_grounded = bool(cmd.get("clientGrounded", False))
         client_jump_count = int(cmd.get("clientJumpCount", 0))
         client_pos_x = float(cmd.get("clientPosX", 0.0))
-        client_vel_x = float(cmd.get("clientVelX", 0.0))
+        _client_vel_x = float(cmd.get("clientVelX", 0.0))
 
         session.last_seq = seq
         session.accepted_drop = False
         reject_reason = ""
 
-        # -----------------------------
-        # 水平
-        # -----------------------------
+        # 水平移动
         session.vel_x = input_x * MOVE_SPEED
         next_x = session.pos_x + session.vel_x * SIM_DT
 
@@ -247,9 +161,7 @@ class RelayServer:
             session.vel_x = 0.0
             reject_reason = "撞墙阻挡"
 
-        # -----------------------------
         # 先按当前位置刷新 grounded（这一拍开始时是否站地）
-        # -----------------------------
         standing_platform = self.get_standing_platform(session)
         if standing_platform is not None and session.vel_y <= 0:
             session.accepted_grounded = True
@@ -263,9 +175,7 @@ class RelayServer:
             if session.accepted_state == "Grounded":
                 session.accepted_state = client_state or "Airborne"
 
-        # -----------------------------
         # 先处理 drop-through
-        # -----------------------------
         current_platform = self.get_standing_platform(session)
         if drop_pressed and down_held:
             if current_platform is not None and current_platform.kind == "oneway":
@@ -277,9 +187,7 @@ class RelayServer:
             else:
                 reject_reason = "当前不在可下落的单向平台上"
 
-        # -----------------------------
         # 再处理 jump（关键：前置）
-        # -----------------------------
         elif jump_pressed:
             if session.accepted_grounded:
                 session.accepted_grounded = False
@@ -293,14 +201,10 @@ class RelayServer:
             else:
                 reject_reason = "超过最大跳跃次数"
 
-        # -----------------------------
         # 最后才做本帧垂直推进（关键）
-        # -----------------------------
         self.step_vertical(session)
 
-        # -----------------------------
         # 用推进后的结果再刷新 grounded
-        # -----------------------------
         standing_platform = self.get_standing_platform(session)
         if standing_platform is not None and session.vel_y <= 0:
             session.accepted_grounded = True
@@ -332,59 +236,6 @@ class RelayServer:
         )
 
         await self.send_snapshot(websocket, session, reject_reason)
-
-    def step_vertical(self, session: ClientSession) -> None:
-        standing = self.get_standing_platform(session)
-        if standing is not None and session.accepted_grounded and session.vel_y <= 0.0:
-            session.pos_y = standing.y
-            session.vel_y = 0.0
-            return
-
-        session.vel_y += GRAVITY
-        if session.vel_y < FALL_SPEED_CAP:
-            session.vel_y = FALL_SPEED_CAP
-
-        previous_y = session.pos_y
-        next_y = session.pos_y + session.vel_y * SIM_DT
-
-        landing = self.find_landing_platform(session.pos_x, previous_y, next_y)
-        if landing is not None and session.vel_y <= 0:
-            session.pos_y = landing.y
-            session.vel_y = 0.0
-            session.accepted_grounded = True
-            if session.accepted_state not in ("Dash", "BasicAttack"):
-                session.accepted_state = "Grounded"
-        else:
-            session.pos_y = next_y
-            session.accepted_grounded = False
-            if session.vel_y < 0 and session.accepted_state not in ("Jump", "Dash", "BasicAttack"):
-                session.accepted_state = "Fall"
-
-    def get_standing_platform(self, session: ClientSession) -> Optional[Platform]:
-        for platform in MAP_PLATFORMS:
-            if self.is_on_platform(session.pos_x, session.pos_y, platform):
-                return platform
-        return None
-
-    def is_on_platform(self, x: float, y: float, platform: Platform) -> bool:
-        within_x = (x + PLAYER_HALF_WIDTH) >= platform.x_min and (x - PLAYER_HALF_WIDTH) <= platform.x_max
-        close_y = abs(y - platform.y) <= GROUND_EPSILON
-        return within_x and close_y
-
-    def find_landing_platform(self, x: float, previous_y: float, next_y: float) -> Optional[Platform]:
-        candidates: List[Platform] = []
-
-        for platform in MAP_PLATFORMS:
-            within_x = (x + PLAYER_HALF_WIDTH) >= platform.x_min and (x - PLAYER_HALF_WIDTH) <= platform.x_max
-            crossed_y = previous_y >= platform.y >= next_y
-            if within_x and crossed_y:
-                candidates.append(platform)
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda p: p.y, reverse=True)
-        return candidates[0]
 
     async def send_snapshot(self, websocket: Any, session: ClientSession, reject_reason: str) -> None:
         snapshot = {
@@ -465,18 +316,21 @@ class RelayServer:
         except ConnectionClosed:
             pass
 
+    def hits_wall(self, x: float, y: float) -> bool:
+        return game_simulation.hits_wall(x, y)
+
+    def step_vertical(self, session: ClientSession) -> None:
+        game_simulation.step_vertical(session)
+
+    def get_standing_platform(self, session: ClientSession) -> Optional[Platform]:
+        return game_simulation.get_standing_platform(session)
+
+    def is_on_platform(self, x: float, y: float, platform: Platform) -> bool:
+        return game_simulation.is_on_platform(x, y, platform)
+
+    def find_landing_platform(self, x: float, previous_y: float, next_y: float) -> Optional[Platform]:
+        return game_simulation.find_landing_platform(x, previous_y, next_y)
+
     @staticmethod
     def utc_now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
-
-
-def main() -> None:
-    server = RelayServer()
-    try:
-        asyncio.run(server.run())
-    except KeyboardInterrupt:
-        print("\n[SERVER] 收到 Ctrl+C，服务已停止")
-
-
-if __name__ == "__main__":
-    main()
