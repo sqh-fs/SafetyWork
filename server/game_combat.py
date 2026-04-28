@@ -12,8 +12,23 @@ from game_config import (
     WEAPON_DB,
     KNOCKBACK_SCALE,
     HITSTUN_BASE_TICKS,
-    HITSTUN_PERCENT_FACTOR_TO_TICKS,
+    HITSTUN_PERCENT_FACTOR_TO_TICKS,MAX_PROJECTILES,
 )
+
+# Debug switches are optional.
+# If game_config.py has not defined them yet, these defaults will be used.
+try:
+    from game_config import (
+        DEBUG_COMBAT_WARN,
+        DEBUG_ATTACK,
+        DEBUG_PROJECTILE,
+        DEBUG_HIT,
+    )
+except ImportError:
+    DEBUG_COMBAT_WARN = True
+    DEBUG_ATTACK = False
+    DEBUG_PROJECTILE = False
+    DEBUG_HIT = True
 
 from game_models import (
     ClientSession,
@@ -25,6 +40,11 @@ from game_models import (
 
 DEFAULT_WEAPON_ID = "手枪"
 DEFAULT_BULLET_ID = "普通子弹"
+
+
+def debug_print(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message)
 
 
 class CombatRuntime:
@@ -47,11 +67,17 @@ class CombatRuntime:
             return WEAPON_DB[weapon_id]
 
         if DEFAULT_WEAPON_ID in WEAPON_DB:
-            print(f"[COMBAT WARN] weapon_id={weapon_id} not found, fallback={DEFAULT_WEAPON_ID}")
+            debug_print(
+                DEBUG_COMBAT_WARN,
+                f"[COMBAT WARN] weapon_id={weapon_id} not found, fallback={DEFAULT_WEAPON_ID}"
+            )
             return WEAPON_DB[DEFAULT_WEAPON_ID]
 
         first_key = next(iter(WEAPON_DB))
-        print(f"[COMBAT WARN] DEFAULT_WEAPON_ID missing, fallback first weapon={first_key}")
+        debug_print(
+            DEBUG_COMBAT_WARN,
+            f"[COMBAT WARN] DEFAULT_WEAPON_ID missing, fallback first weapon={first_key}"
+        )
         return WEAPON_DB[first_key]
 
     def get_bullet_cfg(self, bullet_id: str) -> dict:
@@ -59,11 +85,17 @@ class CombatRuntime:
             return BULLET_DB[bullet_id]
 
         if DEFAULT_BULLET_ID in BULLET_DB:
-            print(f"[COMBAT WARN] bullet_id={bullet_id} not found, fallback={DEFAULT_BULLET_ID}")
+            debug_print(
+                DEBUG_COMBAT_WARN,
+                f"[COMBAT WARN] bullet_id={bullet_id} not found, fallback={DEFAULT_BULLET_ID}"
+            )
             return BULLET_DB[DEFAULT_BULLET_ID]
 
         first_key = next(iter(BULLET_DB))
-        print(f"[COMBAT WARN] DEFAULT_BULLET_ID missing, fallback first bullet={first_key}")
+        debug_print(
+            DEBUG_COMBAT_WARN,
+            f"[COMBAT WARN] DEFAULT_BULLET_ID missing, fallback first bullet={first_key}"
+        )
         return BULLET_DB[first_key]
 
     def get_weapon_bullet_id(self, weapon_cfg: dict) -> str:
@@ -125,7 +157,8 @@ class CombatRuntime:
         weapon_cfg = self.get_weapon_cfg(attacker.equipped_weapon_id)
         attack_mode = weapon_cfg.get("attack_mode", "ranged")
 
-        print(
+        debug_print(
+            DEBUG_ATTACK,
             f"[SERVER ATTACK] "
             f"client={attacker.client_id} "
             f"weapon={attacker.equipped_weapon_id} "
@@ -201,7 +234,8 @@ class CombatRuntime:
             step = spread_angle_deg / max(1, pellet_count - 1)
             angle_offsets_deg = [start_angle + step * i for i in range(pellet_count)]
 
-        print(
+        debug_print(
+            DEBUG_PROJECTILE,
             f"[SERVER BULLET CFG] "
             f"weapon={owner.equipped_weapon_id} "
             f"bulletId={bullet_id} "
@@ -215,7 +249,8 @@ class CombatRuntime:
 
             shot_dir_x = math.cos(angle_rad)
             shot_dir_y = math.sin(angle_rad)
-
+            if len(self.projectiles) >= MAX_PROJECTILES:
+                return
             self._spawn_one_projectile(
                 owner_client_id=owner.client_id,
                 weapon_id=owner.equipped_weapon_id,
@@ -324,7 +359,8 @@ class CombatRuntime:
             },
         )
 
-        print(
+        debug_print(
+            DEBUG_PROJECTILE,
             f"[SERVER PROJECTILE SPAWN] "
             f"projId={proj.proj_id} "
             f"owner={proj.owner_client_id} "
@@ -361,7 +397,8 @@ class CombatRuntime:
 
         bullet_id = self.normalize_special_bullet_id(bullet_id)
         bullet_cfg = self.get_bullet_cfg(bullet_id)
-
+        if len(self.projectiles) >= MAX_PROJECTILES:
+            return
         if not visual_id:
             visual_id = self.resolve_visual_id(bullet_id, bullet_cfg)
 
@@ -370,7 +407,7 @@ class CombatRuntime:
                 rotation_deg = 0.0
             else:
                 rotation_deg = math.degrees(math.atan2(vel_y, vel_x))
-
+  
         proj = ServerProjectile(
             proj_id=self.next_projectile_id,
             owner_client_id=owner_client_id,
@@ -410,7 +447,8 @@ class CombatRuntime:
             },
         )
 
-        print(
+        debug_print(
+            DEBUG_PROJECTILE,
             f"[SERVER CUSTOM PROJECTILE] "
             f"projId={proj.proj_id} "
             f"owner={proj.owner_client_id} "
@@ -438,7 +476,7 @@ class CombatRuntime:
     ) -> None:
         cfg = MELEE_DB.get(melee_profile)
         if cfg is None or attacker.client_id is None:
-            print(f"[COMBAT WARN] melee_profile={melee_profile} not found.")
+            debug_print(DEBUG_COMBAT_WARN, f"[COMBAT WARN] melee_profile={melee_profile} not found.")
             return
 
         dir_x = aim_x
@@ -485,7 +523,8 @@ class CombatRuntime:
             },
         )
 
-        print(
+        debug_print(
+            DEBUG_ATTACK,
             f"[SERVER MELEE SPAWN] "
             f"hitboxId={hitbox.hitbox_id} "
             f"owner={hitbox.owner_client_id} "
@@ -652,7 +691,8 @@ class CombatRuntime:
                 bottom,
                 top,
             ):
-                print(
+                debug_print(
+                    DEBUG_PROJECTILE,
                     f"[SERVER SWEPT PLAYER HIT] "
                     f"owner={owner_client_id} "
                     f"target={session.client_id} "
@@ -767,13 +807,13 @@ class CombatRuntime:
     # ------------------------------------------------------------------
 
     def apply_hit(
-    self,
-    attacker: ClientSession,
-    target: ClientSession,
-    damage: float,
-    base_knockback: float,
-    weapon_id: str,
-    tick: int,
+        self,
+        attacker: ClientSession,
+        target: ClientSession,
+        damage: float,
+        base_knockback: float,
+        weapon_id: str,
+        tick: int,
     ) -> None:
         if target.is_dead:
             return
@@ -855,7 +895,8 @@ class CombatRuntime:
             },
         )
 
-        print(
+        debug_print(
+            DEBUG_HIT,
             f"[SERVER PLAYER HIT] attacker={attacker.client_id} target={target.client_id} "
             f"weapon={weapon_id} damage={final_damage:.2f} "
             f"damageBefore={damage_before_hit:.2f} damageAfter={target.damage_percent:.2f} "
@@ -871,9 +912,9 @@ class CombatRuntime:
     # ------------------------------------------------------------------
 
     def step_projectiles(
-    self,
-    sessions: Dict[object, ClientSession],
-    tick: int,
+        self,
+        sessions: Dict[object, ClientSession],
+        tick: int,
     ) -> None:
         dead_ids = set()
 
@@ -903,7 +944,8 @@ class CombatRuntime:
                     },
                 )
 
-                print(
+                debug_print(
+                    DEBUG_PROJECTILE,
                     f"[SERVER PROJECTILE TTL END] "
                     f"projId={proj.proj_id} "
                     f"weapon={proj.weapon_id} "
@@ -953,7 +995,8 @@ class CombatRuntime:
                 proj.pos_x = next_x
                 proj.pos_y = next_y
 
-                print(
+                debug_print(
+                    DEBUG_PROJECTILE,
                     f"[SERVER PROJECTILE WORLD HIT] "
                     f"projId={proj.proj_id} "
                     f"weapon={proj.weapon_id} "
@@ -1011,7 +1054,8 @@ class CombatRuntime:
                     proj.owner_client_id,
                 )
 
-                print(
+                debug_print(
+                    DEBUG_PROJECTILE,
                     f"[SERVER PROJECTILE PLAYER HIT] "
                     f"projId={proj.proj_id} "
                     f"owner={proj.owner_client_id} "

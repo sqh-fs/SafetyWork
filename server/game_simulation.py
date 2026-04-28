@@ -19,16 +19,16 @@ from game_models import ClientSession, Platform, RectCollider
 
 MAP_PLATFORMS: List[Platform] = [
     Platform(x_min=-9, x_max=29, y=GROUND_Y, kind="solid"),
-    Platform(x_min=-1.25, x_max=1.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=8.75, x_max=11.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=18.75, x_max=21.25, y=1.0 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=3.75, x_max=6.25, y=2.5 + OFFSET_Y, kind="oneway"),
-    Platform(x_min=13.75, x_max=16.25, y=2.5 + OFFSET_Y, kind="oneway"),
+    Platform(x_min=-1.2, x_max=1.2, y=1.0 + OFFSET_Y, kind="oneway"),
+    Platform(x_min=8.8, x_max=11.2, y=1.0 + OFFSET_Y, kind="oneway"),
+    Platform(x_min=18.8, x_max=21.2, y=1.0 + OFFSET_Y, kind="oneway"),
+    Platform(x_min=3.8, x_max=6.2, y=2.5 + OFFSET_Y, kind="oneway"),
+    Platform(x_min=13.8, x_max=16.2, y=2.5 + OFFSET_Y, kind="oneway"),
 ]
 
 MAP_WALLS: List[RectCollider] = [
-    RectCollider(x_min=-9.0, x_max=-8.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
-    RectCollider(x_min=29.0, x_max=29.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
+    RectCollider(x_min=-9.5, x_max=-8.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
+    RectCollider(x_min=28.5, x_max=29.5, y_min=GROUND_Y, y_max=GROUND_Y + 1.5, kind="solid"),
 ]
 
 

@@ -4,8 +4,13 @@ using UnityEngine.InputSystem;
 public class InputPacker : MonoBehaviour
 {
     [Header("调试")]
-    [SerializeField] private bool debugInputLog = true;
-    [SerializeField] private int logEveryNPackets = 10;
+    [SerializeField] private bool debugInputLog = false;
+    [SerializeField] private int logEveryNPackets = 30;
+
+    [Header("网络发送")]
+    [Tooltip("只控制网络发包频率，不控制本地预测频率。1/30=30Hz，0.05=20Hz。")]
+    [SerializeField] private float sendInterval = 1f / 30f;
+    private float sendTimer;
 
     [Header("引用")]
     [SerializeField] private RelayChatClient relayClient;
@@ -25,9 +30,12 @@ public class InputPacker : MonoBehaviour
     private void Awake()
     {
         if (relayClient == null)
+            relayClient = RelayChatClient.Instance;
+
+        if (relayClient == null)
             relayClient = FindFirstObjectByType<RelayChatClient>();
 
-        // 等 Binder 来绑定本地 Player。
+        // 等 MainGamePlayerBinder 来绑定本地 Player。
         enabled = false;
     }
 
@@ -44,10 +52,14 @@ public class InputPacker : MonoBehaviour
         predictionController = newPredictionController;
 
         if (relayClient == null)
+            relayClient = RelayChatClient.Instance;
+
+        if (relayClient == null)
             relayClient = FindFirstObjectByType<RelayChatClient>();
 
         currentSeq = 0;
         currentTick = 0;
+        sendTimer = 0f;
 
         jumpPressedBuffered = false;
         attackPressedBuffered = false;
@@ -80,7 +92,8 @@ public class InputPacker : MonoBehaviour
         Debug.Log(
             $"[InputPacker] BindPlayer -> player={player.name}, " +
             $"localClient={relayClient?.ClientId}, " +
-            $"prediction={(predictionController != null ? predictionController.name : "null")}"
+            $"prediction={(predictionController != null ? predictionController.name : "null")}, " +
+            $"sendInterval={sendInterval:F4}s"
         );
     }
 
@@ -117,8 +130,10 @@ public class InputPacker : MonoBehaviour
         if (!relayClient.HasJoinedRoom)
             return;
 
-        currentTick++;
-
+        // ------------------------------------------------------------
+        // 1. 每个 FixedUpdate 都读输入 + 本地预测
+        // 这保证本地操作手感不是 20/30Hz。
+        // ------------------------------------------------------------
         Vector2 move = input.Player.Movement.ReadValue<Vector2>();
         Vector2 aim = ReadAimDirection();
 
@@ -141,6 +156,24 @@ public class InputPacker : MonoBehaviour
             downHeld,
             dropPressed
         );
+
+        // ------------------------------------------------------------
+        // 2. 网络发包限频
+        // 本地预测每帧跑，但 SendInput 不每帧发。
+        // ------------------------------------------------------------
+        sendTimer += Time.fixedDeltaTime;
+
+        if (sendTimer < sendInterval)
+        {
+            // 不能清 jumpPressedBuffered / attackPressedBuffered。
+            // 否则两个发包间隔之间的瞬时按键会被吃掉。
+            return;
+        }
+
+        // 不用 while 补包，避免卡顿后一帧连发很多包。
+        sendTimer = 0f;
+
+        currentTick++;
 
         PredictedPlayerState predicted = predictionController != null
             ? predictionController.GetPredictedState()
@@ -194,6 +227,7 @@ public class InputPacker : MonoBehaviour
 
         _ = relayClient.SendInput(cmd);
 
+        // 只有真正发出网络包后，才清瞬时输入。
         jumpPressedBuffered = false;
         attackPressedBuffered = false;
     }

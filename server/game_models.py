@@ -10,6 +10,20 @@ from game_config import (
 
 
 @dataclass
+class ServerLoot:
+    loot_id: str
+    loot_type: str          # "effect" / "weapon"
+    item_id: str            # effectId 或 weaponId
+    pos_x: float
+    pos_y: float            # 空投中心 y，不是 footY
+    radius: float = 0.75
+    alive: bool = True
+
+    vel_y: float = 0.0
+    landed: bool = False
+    target_platform_y: float = 0.0
+
+@dataclass
 class Platform:
     x_min: float
     x_max: float

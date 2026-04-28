@@ -32,7 +32,7 @@ public class RelayChatClient : MonoBehaviour
     [SerializeField] private int jitterMs = 20;
     [SerializeField, Range(0f, 1f)] private float outgoingDropRate = 0f;
     [SerializeField, Range(0f, 1f)] private float incomingDropRate = 0f;
-
+    public static RelayChatClient Instance { get; private set; }
     public string ClientId => clientId;
     public string RoomId => roomId;
     public bool IsConnected => websocket != null && websocket.State == WebSocketState.Open;
@@ -47,7 +47,7 @@ public class RelayChatClient : MonoBehaviour
     private int sentInputCount;
     private int latestAppliedAck = -1;
     private int latestAppliedTick = -1;
-
+    private bool applicationQuitting = false;
     [Serializable]
     private class NetMessage
     {
@@ -67,21 +67,54 @@ public class RelayChatClient : MonoBehaviour
     {
         public string text;
     }
-   
+
+    private void Awake()
+    {
+        if (Instance != null && Instance != this)
+        {
+            Debug.LogWarning(
+                $"[RelayChatClient] Duplicate instance destroyed. " +
+                $"old={Instance.gameObject.name}, new={gameObject.name}"
+            );
+
+            Destroy(gameObject);
+            return;
+        }
+
+        Instance = this;
+
+        // 保险：如果它挂在 Canvas / Manager 的子物体下面，先脱离父物体。
+        transform.SetParent(null);
+
+        DontDestroyOnLoad(gameObject);
+
+        if (debugNetworkLog)
+        {
+            Debug.Log(
+                $"[RelayChatClient] Awake persistent instance. " +
+                $"object={gameObject.name}, instance={GetInstanceID()}, " +
+                $"scene={SceneManager.GetActiveScene().name}"
+            );
+        }
+    }
     private void Start()
     {
         ApplyNetworkSessionToLocalFields();
 
-        Debug.Log(
-            $"[RelayChatClient] Start object={gameObject.name}, " +
-            $"clientId={clientId}, roomId={roomId}, " +
-            $"autoConnect={autoConnect}, autoJoin={autoJoin}"
-        );
+        if (debugNetworkLog)
+        {
+            Debug.Log(
+                $"[RelayChatClient] Start object={gameObject.name}, " +
+                $"instanceId={GetInstanceID()}, " +
+                $"scene={SceneManager.GetActiveScene().name}, " +
+                $"clientId={clientId}, roomId={roomId}, " +
+                $"autoConnect={autoConnect}, autoJoin={autoJoin}"
+            );
+        }
 
         if (autoConnect)
             _ = Connect();
     }
-
     private void ApplyNetworkSessionToLocalFields()
     {
         if (NetworkSession.Instance == null)
@@ -124,7 +157,12 @@ public class RelayChatClient : MonoBehaviour
              websocket.State == WebSocketState.Connecting))
         {
             if (debugNetworkLog)
-                Debug.LogWarning($"[{clientId}] WebSocket 已连接或正在连接中。");
+            {
+                Debug.LogWarning(
+                    $"[{clientId}] WebSocket already open/connecting. " +
+                    $"state={websocket.State}, instance={GetInstanceID()}"
+                );
+            }
 
             return;
         }
@@ -135,7 +173,10 @@ public class RelayChatClient : MonoBehaviour
 
         websocket.OnOpen += () =>
         {
-            Debug.Log($"[{clientId}] 已连接到服务端: {serverUrl}");
+            Debug.Log(
+                $"[{clientId}] WebSocket OPEN server={serverUrl}, " +
+                $"instance={GetInstanceID()}, scene={SceneManager.GetActiveScene().name}"
+            );
 
             if (autoJoin)
             {
@@ -143,7 +184,7 @@ public class RelayChatClient : MonoBehaviour
 
                 if (string.IsNullOrWhiteSpace(roomId))
                 {
-                    Debug.LogWarning($"[{clientId}] autoJoin=true 但 roomId 为空，跳过 JOIN_ROOM。");
+                    Debug.LogWarning($"[{clientId}] autoJoin=true but roomId is empty, skip JOIN_ROOM.");
                     return;
                 }
 
@@ -153,12 +194,16 @@ public class RelayChatClient : MonoBehaviour
 
         websocket.OnError += (errorMsg) =>
         {
-            Debug.LogError($"[{clientId}] WebSocket 错误: {errorMsg}");
+            Debug.LogError($"[{clientId}] WebSocket ERROR: {errorMsg}");
         };
 
         websocket.OnClose += (closeCode) =>
         {
-            Debug.LogWarning($"[{clientId}] 连接已关闭，code={closeCode}");
+            Debug.LogWarning(
+                $"[{clientId}] WebSocket CLOSED code={closeCode}, " +
+                $"instance={GetInstanceID()}, scene={SceneManager.GetActiveScene().name}"
+            );
+
             hasJoinedRoom = false;
         };
 
@@ -168,10 +213,13 @@ public class RelayChatClient : MonoBehaviour
             HandleIncomingMessage(text);
         };
 
-        Debug.Log($"[{clientId}] 正在连接: {serverUrl}");
+        Debug.Log(
+            $"[{clientId}] WebSocket CONNECTING server={serverUrl}, " +
+            $"instance={GetInstanceID()}, scene={SceneManager.GetActiveScene().name}"
+        );
+
         await websocket.Connect();
     }
-
     private async Task EnsureConnected()
     {
         if (websocket != null && websocket.State == WebSocketState.Open)
@@ -242,19 +290,32 @@ public class RelayChatClient : MonoBehaviour
         if (!EnsureSocketOpen())
             return;
 
-        // Lobby 阶段 wantedClientId 可以为空，让服务器分配 Client1 / Client2。
-        // MainGame 重连阶段会传入 NetworkSession.clientId。
-        if (wantedClientId != null)
-            clientId = wantedClientId.Trim();
+        string nextClientId = wantedClientId != null ? wantedClientId.Trim() : clientId;
+        string nextRoomId = wantedRoomId != null ? wantedRoomId.Trim().ToUpper() : roomId;
 
-        if (wantedRoomId != null)
-            roomId = wantedRoomId.Trim().ToUpper();
-
-        if (string.IsNullOrWhiteSpace(roomId))
+        if (string.IsNullOrWhiteSpace(nextRoomId))
         {
-            Debug.LogWarning($"[{clientId}] JOIN_ROOM 失败：roomId 为空。");
+            Debug.LogWarning($"[{clientId}] JOIN_ROOM failed: roomId is empty.");
             return;
         }
+
+        if (hasJoinedRoom &&
+            string.Equals(roomId, nextRoomId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(clientId, nextClientId, StringComparison.OrdinalIgnoreCase))
+        {
+            if (debugNetworkLog)
+            {
+                Debug.Log(
+                    $"[{clientId}] Skip duplicate JOIN_ROOM. " +
+                    $"room={roomId}, instance={GetInstanceID()}"
+                );
+            }
+
+            return;
+        }
+
+        clientId = nextClientId;
+        roomId = nextRoomId;
 
         var msg = new NetMessage
         {
@@ -270,11 +331,10 @@ public class RelayChatClient : MonoBehaviour
         {
             Debug.Log(
                 $"[{clientId}] SEND JOIN_ROOM room={roomId}, " +
-                $"requestedClient={clientId}"
+                $"requestedClient={clientId}, instance={GetInstanceID()}"
             );
         }
     }
-
     public async Task SendReady(bool ready)
     {
         if (!EnsureSocketOpen())
@@ -428,22 +488,35 @@ public class RelayChatClient : MonoBehaviour
 
     public async Task Disconnect()
     {
-        if (websocket == null)
-            return;
-
-        if (websocket.State == WebSocketState.Open ||
-            websocket.State == WebSocketState.Connecting)
-        {
-            await websocket.Close();
-        }
+        WebSocket socketToClose = websocket;
 
         websocket = null;
         hasJoinedRoom = false;
 
-        if (debugNetworkLog)
-            Debug.Log($"[{clientId}] 已执行 Disconnect。");
-    }
+        if (socketToClose == null)
+            return;
 
+        try
+        {
+            if (socketToClose.State == WebSocketState.Open ||
+                socketToClose.State == WebSocketState.Connecting)
+            {
+                await socketToClose.Close();
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[{clientId}] Disconnect exception: {ex.Message}");
+        }
+
+        if (debugNetworkLog)
+        {
+            Debug.Log(
+                $"[{clientId}] Disconnect done. " +
+                $"instance={GetInstanceID()}, scene={SceneManager.GetActiveScene().name}"
+            );
+        }
+    }
     private async Task SendJson(NetMessage message, bool bypassSimulation)
     {
         if (websocket == null)
@@ -799,9 +872,31 @@ public class RelayChatClient : MonoBehaviour
 
     private async void OnApplicationQuit()
     {
+        applicationQuitting = true;
+
+        if (debugNetworkLog)
+        {
+            Debug.Log(
+                $"[RelayChatClient] OnApplicationQuit, disconnect socket. " +
+                $"instance={GetInstanceID()}"
+            );
+        }
+
         await Disconnect();
     }
+    public async Task LeaveAndDisconnect()
+    {
+        applicationQuitting = true;
 
+        await Disconnect();
+
+        if (Instance == this)
+        {
+            Instance = null;
+        }
+
+        Destroy(gameObject);
+    }
     [ContextMenu("Connect")]
     private void ConnectFromMenu()
     {
@@ -824,5 +919,29 @@ public class RelayChatClient : MonoBehaviour
     private void DisconnectFromMenu()
     {
         _ = Disconnect();
+    }
+    private async void OnDestroy()
+    {
+        if (Instance == this)
+        {
+            Instance = null;
+        }
+
+        // 场景切换时不要主动断开 WebSocket。
+        // 只有应用退出时才真正断线。
+        if (!applicationQuitting)
+        {
+            if (debugNetworkLog)
+            {
+                Debug.Log(
+                    $"[RelayChatClient] OnDestroy during scene change, keep socket if possible. " +
+                    $"instance={GetInstanceID()}, scene={SceneManager.GetActiveScene().name}"
+                );
+            }
+
+            return;
+        }
+
+        await Disconnect();
     }
 }

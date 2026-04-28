@@ -10,7 +10,7 @@ public class MatchSnapshot
     public PlayerSnapshot[] players;
     public ProjectileSnapshot[] projectiles;
     public MatchEventSnapshot[] events;
-
+    public LootSnapshot[] loots;
     public PlayerSnapshot FindPlayer(string clientId)
     {
         if (players == null || string.IsNullOrWhiteSpace(clientId))
@@ -116,5 +116,23 @@ public class MatchEventData
 
     public int stocksLeft;
 
+
+    public string lootId;
+    public string lootType;
+    public string itemId;
+
     public string reason;
+}
+[System.Serializable]
+public class LootSnapshot
+{
+    public string lootId;
+    public string lootType;
+    public string itemId;
+
+    public float posX;
+    public float posY;
+    public float radius;
+    public float velY;
+    public bool landed;
 }

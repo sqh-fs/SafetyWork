@@ -1,8 +1,42 @@
 HOST = "0.0.0.0"
 PORT = 8765
+# relay_server 相关
+DEBUG_INPUT = False
+DEBUG_ATTACK = False
+
+DEBUG_LOOT = False
+DEBUG_ROOM = True
+DEBUG_CONNECTION = True
+
+# game_combat 相关
+DEBUG_COMBAT_WARN = False
+DEBUG_ATTACK = False
+DEBUG_PROJECTILE = False
+DEBUG_HIT = False
+
+# -----------------------------
+# Snapshot broadcast throttle
+# -----------------------------
+# True  = 按 SNAPSHOT_INTERVAL_TICKS 降频广播
+# False = 每 tick 都广播，恢复旧逻辑
+SNAPSHOT_THROTTLE_ENABLED = True
+
+# 每多少个 server tick 广播一次 snapshot。
+# 1 = 每 tick 广播
+# 2 = 每 2 tick 广播
+# 3 = 每 3 tick 广播
+SNAPSHOT_INTERVAL_TICKS = 2
+
+# 是否遇到事件时强制立即广播。
+# 测带宽时建议 False。
+# 如果你发现命中/拾取/爆炸事件延迟明显，可以改 True。
+SNAPSHOT_FORCE_BROADCAST_ON_EVENTS = False
+
+
+MAX_PROJECTILES = 50
 
 MAX_JUMP_COUNT = 2
-MOVEMENT_MULTIPLIER = 0.2
+MOVEMENT_MULTIPLIER = 0.5
 
 # -----------------------------
 # Simplified map / collision
@@ -14,8 +48,8 @@ PLAYER_HALF_HEIGHT = 0.42
 # -----------------------------
 # Unified movement parameters
 # -----------------------------
-SIM_DT = 0.05
-MOVE_SPEED = 16.0 * MOVEMENT_MULTIPLIER
+SIM_DT = SIM_DT = 1.0 / 30.0
+MOVE_SPEED = 32.0 * MOVEMENT_MULTIPLIER
 
 GRAVITY = -2.0 * MOVEMENT_MULTIPLIER
 JUMP_VELOCITY = 30.0 * MOVEMENT_MULTIPLIER
@@ -71,6 +105,54 @@ GS_JSON_PAYLOAD_TYPES = {
     TYPE_READY,
     TYPE_START_GAME,
 }
+LOOT_SPAWN_INTERVAL_TICKS = int(2.0 / SIM_DT)
+LOOT_PICKUP_RADIUS = 0.75
+# -----------------------------
+# Loot falling
+# -----------------------------
+LOOT_MAX_ALIVE = 5
+
+# 空投生成时从目标区域上方多高开始掉落
+LOOT_SPAWN_Y = 8.5
+
+# 空投下落重力，数值可以比角色重力大一点
+LOOT_GRAVITY = -0.04
+
+# 最大下落速度
+LOOT_FALL_SPEED_CAP = -2.0
+
+# 空投中心落在平台上方多少
+# 你的 loot sprite 如果中心在箱子中心，这里一般 0.45~0.7
+LOOT_HALF_HEIGHT = 0.4
+
+# 平台边缘安全距离，避免刚好落到边缘
+LOOT_DROP_PLATFORM_MARGIN = 0.33
+
+# 是否只有落地后才能捡
+LOOT_PICKUP_ONLY_WHEN_LANDED = False
+EFFECT_DROP_POINTS = [
+    {"x": 3.0, "y": GROUND_Y + 0.6},
+    {"x": 10.0, "y": GROUND_Y + 0.6},
+    {"x": 17.0, "y": GROUND_Y + 0.6},
+]
+EFFECT_DROP_POOL = [
+    "delayed_explosion",
+    "hover_split",
+    "parry",
+    "sword_wave",
+]
+WEAPON_DROP_POOL = [
+    "手枪",
+    "重机枪",
+    "狙击枪",
+    "霰弹枪",
+    "短剑",
+]
+
+LOOT_TYPE_WEIGHTS = {
+    "effect": 0.5,
+    "weapon": 0.5,
+}
 # -----------------------------
 # Spawn / Respawn points
 # 注意：这里是服务器逻辑坐标，pos_y 是 footY，不是 Unity transform centerY
@@ -104,21 +186,21 @@ WEAPON_DB = {
     "手枪": {
         "attack_mode": "ranged",
         "bullet_id": "普通子弹",
-        "fire_interval_ticks": 10,
+        "fire_interval_ticks": 15,
         "auto_fire": True,
     },
 
     "狙击枪": {
         "attack_mode": "ranged",
         "bullet_id": "狙击子弹",
-        "fire_interval_ticks": 35,
+        "fire_interval_ticks": 55,
         "auto_fire": True,
     },
 
     "重机枪": {
         "attack_mode": "ranged",
         "bullet_id": "机枪子弹",
-        "fire_interval_ticks": 3,
+        "fire_interval_ticks": 6,
         "auto_fire": True,
     },
 

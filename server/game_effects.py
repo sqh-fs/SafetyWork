@@ -4,7 +4,12 @@ from typing import Dict, List
 from game_config import EFFECT_DB
 from game_models import ServerProjectile
 
-
+try:
+    from game_config import DEBUG_PROJECTILE, DEBUG_ATTACK, DEBUG_HIT
+except ImportError:
+    DEBUG_PROJECTILE = False
+    DEBUG_ATTACK = False
+    DEBUG_HIT = True
 # ------------------------------------------------------------
 # Effect id 兼容层
 # 解决 Unity 发 hoversplit / delayedexplosion / swordwave
@@ -28,7 +33,9 @@ EFFECT_ID_ALIASES = {
     "Effect_Parry": "parry",
 }
 
-
+def debug_print(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message)
 def normalize_effect_id(effect_id: str) -> str:
     if effect_id is None:
         return ""
@@ -88,7 +95,8 @@ def apply_effects_on_projectile_spawned(combat_runtime, sessions, proj: ServerPr
 
         proj.hover_split_done = False
 
-        print(
+        debug_print(
+            DEBUG_PROJECTILE,
             f"[EFFECT HOVER INIT] "
             f"projId={proj.proj_id} "
             f"startVel=({proj.vel_x:.2f},{proj.vel_y:.2f}) "
@@ -370,7 +378,10 @@ def execute_sword_wave(
     dir_y = aim_y / mag
 
     new_effects = normalize_effect_list(effect_ids) if cfg.get("inherit_runtime_effects", True) else []
-    new_effects = [eid for eid in new_effects if eid != "sword_wave"]
+    new_effects = [
+    eid for eid in new_effects
+    if eid not in ("sword_wave", "hover_split", "delayed_explosion")
+    ]
 
     damage_mul = float(cfg["damage_multiplier"])
     speed = float(cfg["speed"])
@@ -419,7 +430,8 @@ def trigger_delayed_explosion(
         },
     )
 
-    print(
+    debug_print(
+        DEBUG_PROJECTILE,
         f"[SERVER EXPLOSION] "
         f"projId={proj.proj_id} "
         f"owner={proj.owner_client_id} "
@@ -479,7 +491,10 @@ def trigger_hover_split(combat_runtime, proj: ServerProjectile, cfg: Dict) -> No
     child_effects = normalize_effect_list(list(proj.effect_ids))
 
     if inherit_except_self:
-        child_effects = [eid for eid in child_effects if eid != "hover_split"]
+        child_effects = [
+        eid for eid in child_effects
+        if eid not in ("hover_split")
+    ]
 
     speed = float(getattr(proj, "hover_split_start_speed", 0.0))
 
@@ -492,7 +507,8 @@ def trigger_hover_split(combat_runtime, proj: ServerProjectile, cfg: Dict) -> No
     bullet_id = getattr(proj, "bullet_id", "")
     visual_id = getattr(proj, "visual_id", "")
 
-    print(
+    debug_print(
+        DEBUG_PROJECTILE,
         f"[SERVER HOVER SPLIT] "
         f"parent={proj.proj_id} "
         f"splitCount={split_count} "

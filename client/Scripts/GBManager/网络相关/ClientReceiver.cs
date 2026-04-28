@@ -96,9 +96,16 @@ public class ClientReceiver : MonoBehaviour
         ApplyPlayers(snapshot);
         ApplyProjectiles(snapshot);
         ApplyStocksFromSnapshot(snapshot);
+        ApplyLoots(snapshot);
         ConsumeEvents(snapshot);
     }
+    private void ApplyLoots(MatchSnapshot snapshot)
+    {
+        if (LootViewManager.Instance == null)
+            return;
 
+        LootViewManager.Instance.ApplySnapshot(snapshot.loots);
+    }
     private void ApplyPlayers(MatchSnapshot snapshot)
     {
         if (snapshot.players == null)
@@ -171,7 +178,7 @@ public class ClientReceiver : MonoBehaviour
             return;
 
         target.ApplyServerWeapon(ps.equippedWeaponId);
-
+        target.ApplyServerEffects(ps.equippedEffectIds);
         Player_Health health = target.GetComponent<Player_Health>();
 
         if (health != null)
@@ -265,6 +272,23 @@ public class ClientReceiver : MonoBehaviour
                 case "PLAYER_RESPAWN":
                     {
                         HandlePlayerRespawn(evt, data);
+                        break;
+                    }
+                case "LOOT_SPAWNED":
+                    {
+                        HandleLootSpawned(evt, data);
+                        break;
+                    }
+
+                case "LOOT_PICKED":
+                    {
+                        HandleLootPicked(evt, data);
+                        break;
+                    }
+
+                case "LOOT_DESPAWNED":
+                    {
+                        HandleLootDespawned(evt, data);
                         break;
                     }
 
@@ -488,5 +512,48 @@ public class ClientReceiver : MonoBehaviour
             return player2;
 
         return null;
+    }
+
+    private void HandleLootSpawned(MatchEventSnapshot evt, MatchEventData data)
+    {
+        if (data == null)
+            return;
+
+        if (debugEventLog)
+        {
+            Debug.Log(
+                $"[ClientReceiver] LOOT_SPAWNED " +
+                $"lootId={data.lootId} type={data.lootType} item={data.itemId} " +
+                $"pos=({data.x:F2},{data.y:F2})"
+            );
+        }
+
+        // 其实 snapshot.loots 已经会生成，这里主要可以播出现特效。
+        //NetworkVFXManager.Instance?.Spawn("loot_spawn", data.x, data.y);
+    }
+
+    private void HandleLootPicked(MatchEventSnapshot evt, MatchEventData data)
+    {
+        if (data == null)
+            return;
+
+        if (debugEventLog)
+        {
+            Debug.Log(
+                $"[ClientReceiver] LOOT_PICKED " +
+                $"lootId={data.lootId} item={data.itemId} by={data.clientId}"
+            );
+        }
+
+        LootViewManager.Instance?.Remove(data.lootId);
+        //NetworkVFXManager.Instance?.Spawn("loot_pick", data.x, data.y);
+    }
+
+    private void HandleLootDespawned(MatchEventSnapshot evt, MatchEventData data)
+    {
+        if (data == null)
+            return;
+
+        LootViewManager.Instance?.Remove(data.lootId);
     }
 }

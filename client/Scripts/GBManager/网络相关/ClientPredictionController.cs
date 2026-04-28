@@ -15,6 +15,16 @@ public class ClientPredictionController : MonoBehaviour
     [SerializeField] private float fallSpeedCap = -7.2f;
     [SerializeField] private float snapThreshold = 1.0f;
 
+    [Header("显示平滑")]
+    [Tooltip("开启后，预测/校正只更新目标点，真正显示位置在 Update 里平滑移动。")]
+    [SerializeField] private bool smoothVisualPosition = true;
+
+    [Tooltip("显示位置平滑时间。越小越跟手，越大越柔和。建议 0.03 ~ 0.08。")]
+    [SerializeField] private float visualSmoothTime = 0.045f;
+
+    [Tooltip("显示位置和目标点距离超过该值时，直接瞬移过去。用于复活/大击飞/严重校正。")]
+    [SerializeField] private float visualSnapDistance = 2.0f;
+
     [Header("地图参数，需要和服务器一致")]
     [SerializeField] private float groundEpsilon = 0.001f;
     [SerializeField] private float playerHalfWidth = 0.46f;
@@ -26,6 +36,10 @@ public class ClientPredictionController : MonoBehaviour
 
     private readonly List<PlayerInputCmd> pendingInputs = new List<PlayerInputCmd>();
     private PredictedPlayerState predictedState;
+
+    private Vector3 visualTargetPosition;
+    private Vector3 visualVelocity;
+    private bool hasVisualTarget;
 
     private float GroundY => -1.45f + offsetY;
     private const int MaxJumpCount = 2;
@@ -77,6 +91,44 @@ public class ClientPredictionController : MonoBehaviour
             ResetPredictedStateFromPlayer();
     }
 
+    private void Update()
+    {
+        if (player == null)
+            return;
+
+        if (!smoothVisualPosition)
+            return;
+
+        if (!hasVisualTarget)
+            return;
+
+        Vector3 current = player.transform.position;
+        float dist = Vector3.Distance(current, visualTargetPosition);
+
+        if (dist > visualSnapDistance)
+        {
+            player.SetLogicalPosition(
+                visualTargetPosition.x,
+                visualTargetPosition.y
+            );
+
+            visualVelocity = Vector3.zero;
+            return;
+        }
+
+        Vector3 smoothed = Vector3.SmoothDamp(
+            current,
+            visualTargetPosition,
+            ref visualVelocity,
+            visualSmoothTime
+        );
+
+        player.SetLogicalPosition(
+            smoothed.x,
+            smoothed.y
+        );
+    }
+
     public void BindPlayer(Player newPlayer)
     {
         player = newPlayer;
@@ -105,13 +157,38 @@ public class ClientPredictionController : MonoBehaviour
         predictedState.jumpCount = 0;
         predictedState.acceptedDrop = false;
         predictedState.stateName = "Grounded";
+
+        float displayY = FootYToTransformY(predictedState.posY);
+
+        visualTargetPosition = new Vector3(
+            predictedState.posX,
+            displayY,
+            p.z
+        );
+
+        visualVelocity = Vector3.zero;
+        hasVisualTarget = true;
+
+        player.SetLogicalPosition(
+            visualTargetPosition.x,
+            visualTargetPosition.y
+        );
+
+        player.ApplyServerState(
+            predictedState.stateName,
+            predictedState.grounded,
+            predictedState.jumpCount
+        );
     }
 
     public void AddLocalInput(PlayerInputCmd cmd)
     {
         pendingInputs.Add(cmd);
         Simulate(ref predictedState, cmd);
-        ApplyPredictedState();
+
+        // 不再每次输入都硬设置 transform。
+        // 这里只更新显示目标点，Update 每帧平滑过去。
+        ApplyPredictedState(false);
     }
 
     public void Reconcile(MatchSnapshot snapshot, string localClientId)
@@ -187,7 +264,8 @@ public class ClientPredictionController : MonoBehaviour
                 );
             }
 
-            ApplyPredictedState();
+            // 受击/死亡/复活这种状态直接吸附，避免平滑导致位置拖影。
+            ApplyPredictedState(true);
             return;
         }
 
@@ -201,6 +279,8 @@ public class ClientPredictionController : MonoBehaviour
             new Vector2(beforeX, beforeY),
             new Vector2(predictedState.posX, predictedState.posY)
         );
+
+        bool forceSnap = false;
 
         if (error > snapThreshold)
         {
@@ -222,9 +302,12 @@ public class ClientPredictionController : MonoBehaviour
             predictedState.grounded = localPlayer.grounded;
             predictedState.jumpCount = localPlayer.jumpCount;
             predictedState.stateName = localPlayer.state;
+
+            // 大误差直接吸附，防止拖着一条长长的影子追目标。
+            forceSnap = true;
         }
 
-        ApplyPredictedState();
+        ApplyPredictedState(forceSnap);
 
         if (debugLog)
         {
@@ -243,24 +326,38 @@ public class ClientPredictionController : MonoBehaviour
         return predictedState;
     }
 
-    private void ApplyPredictedState()
+    private void ApplyPredictedState(bool forceSnap)
     {
         if (player == null)
             return;
 
-        float displayY = predictedState.posY + playerHalfHeight;
+        float displayY = FootYToTransformY(predictedState.posY);
 
-        player.SetLogicalPosition(
+        visualTargetPosition = new Vector3(
             predictedState.posX,
-            displayY
+            displayY,
+            player.transform.position.z
         );
+
+        hasVisualTarget = true;
 
         player.ApplyServerState(
             predictedState.stateName,
             predictedState.grounded,
             predictedState.jumpCount
         );
+
+        if (!smoothVisualPosition || forceSnap)
+        {
+            player.SetLogicalPosition(
+                visualTargetPosition.x,
+                visualTargetPosition.y
+            );
+
+            visualVelocity = Vector3.zero;
+        }
     }
+
     private void Simulate(ref PredictedPlayerState state, PlayerInputCmd cmd)
     {
         float inputX = Mathf.Clamp(cmd.moveX, -1f, 1f);
@@ -351,6 +448,7 @@ public class ClientPredictionController : MonoBehaviour
                 state.stateName = "Airborne";
         }
     }
+
     public bool CanJumpDebug()
     {
         return predictedState.grounded || predictedState.jumpCount < MaxJumpCount;
@@ -380,6 +478,7 @@ public class ClientPredictionController : MonoBehaviour
     {
         return predictedState.velY;
     }
+
     private void StepVertical(ref PredictedPlayerState state)
     {
         PlatformData? standing = GetStandingPlatform(state.posX, state.posY);
