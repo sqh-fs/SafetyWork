@@ -1,23 +1,25 @@
-"""AS 端到端冒烟测试脚本。
+"""AS WebSocket 基本链路 smoke test。
 
-测试目标：
-- 使用 as_public_key.pem 模拟客户端加密请求。
-- 通过 WebSocket 连到 AS。
-- 依次验证注册、登录、loginGen 递增、改密、旧密码失效、新密码可登录。
+本脚本通过 AS 公钥构造真实协议请求，覆盖:
+- 注册新用户。
+- 连续登录并确认 loginGen 递增。
+- 修改密码。
+- 旧密码登录失败。
+- 新密码登录成功。
 
-运行前置条件：
-- MySQL 已执行 schema_auth.sql。
-- 已运行 seed_auth_keys.py 导出 AS 公钥。
-- AS 服务已启动。
+运行前置条件:
+- 已执行 as/schema_auth.sql 初始化两张表。
+- 已运行 seed_auth_keys.py 生成 as/as_public_key.pem、AS 私钥和 K_TGS。
+- 已启动 as_server.py，并为服务端设置 AS_RSA_PRIVATE_KEY_PATH 和 K_TGS_BASE64。
 - 已安装 as/requirements.txt。
 
-主要输入：
-- AS_URL：AS WebSocket 地址，默认 ws://127.0.0.1:9000。
-- AS_PUBLIC_KEY_PATH：AS 公钥路径，默认 as/as_public_key.pem。
+输入环境变量:
+- AS_URL: AS WebSocket 地址，默认 ws://127.0.0.1:9000。
+- AS_PUBLIC_KEY_PATH: AS 公钥路径，默认 as/as_public_key.pem。
 
-主要输出：
-- 成功时打印 "AS smoke test passed"。
-- 任一断言失败时抛 AssertionError，指出协议或行为不符合预期。
+输出:
+- 全部断言通过时打印 "AS smoke test passed"。
+- 协议错误、断言失败或连接失败时抛出异常，便于 CI 或人工排查。
 """
 
 import asyncio
@@ -56,14 +58,14 @@ PUBLIC_KEY_PATH = Path(
 def load_public_key() -> bytes:
     """读取 AS 公钥 PEM。
 
-    输入：
-    - AS_PUBLIC_KEY_PATH 环境变量或默认路径。
+    输入:
+    - AS_PUBLIC_KEY_PATH 指向的 PEM 文件。
 
-    输出：
-    - bytes：PEM 格式公钥。
+    返回:
+    - bytes，AS RSA 公钥 PEM。
 
-    异常：
-    - FileNotFoundError：未运行 seed_auth_keys.py 或路径配置错误。
+    异常:
+    - FileNotFoundError: 尚未运行 seed_auth_keys.py 或路径设置错误。
     """
 
     if not PUBLIC_KEY_PATH.exists():
@@ -74,17 +76,17 @@ def load_public_key() -> bytes:
 
 
 async def request(ws, message: str) -> dict:
-    """发送一条请求并要求 AS 返回成功响应。
+    """发送一条请求并要求 AS 返回非 ERROR 响应。
 
-    输入：
-    - ws：已连接的 WebSocket。
-    - message：JSON 文本帧。
+    参数:
+    - ws: WebSocket 连接。
+    - message: JSON 协议字符串。
 
-    输出：
-    - dict：AS 返回的非 ERROR 报文。
+    返回:
+    - AS 响应 dict。
 
-    异常：
-    - AssertionError：AS 返回 ERROR。
+    异常:
+    - AssertionError: AS 返回 ERROR。
     """
 
     await ws.send(message)
@@ -98,16 +100,13 @@ async def request(ws, message: str) -> dict:
 async def request_error(ws, message: str, expected_error: str) -> dict:
     """发送一条请求并要求 AS 返回指定 ERROR。
 
-    输入：
-    - ws：已连接的 WebSocket。
-    - message：JSON 文本帧。
-    - expected_error：期望的错误码。
+    参数:
+    - ws: WebSocket 连接。
+    - message: JSON 协议字符串。
+    - expected_error: 期望的机器可读错误码。
 
-    输出：
-    - dict：AS 返回的 ERROR 报文。
-
-    用途：
-    - 验证改密后旧密码登录会失败。
+    返回:
+    - ERROR 响应 dict。
     """
 
     await ws.send(message)
@@ -121,16 +120,16 @@ async def request_error(ws, message: str, expected_error: str) -> dict:
 
 
 def encrypted_message(public_key: bytes, msg_type: str, client_id: str, payload: dict) -> str:
-    """构造客户端侧 RSA 加密请求。
+    """构造带 RSA 加密 payload 的 AS 请求。
 
-    输入：
-    - public_key：AS 公钥 PEM。
-    - msg_type：REGISTER_REQ、AS_REQ 或 CHANGE_PASSWORD_REQ。
-    - client_id：客户端实例 ID。
-    - payload：请求明文对象。
+    参数:
+    - public_key: AS RSA 公钥 PEM。
+    - msg_type: REGISTER_REQ、AS_REQ 或 CHANGE_PASSWORD_REQ。
+    - client_id: 写入顶层 clientId，也会进入 security_event_log。
+    - payload: 待 RSA 加密的敏感 JSON 对象。
 
-    输出：
-    - str：可直接发送给 AS 的顶层 JSON 报文。
+    返回:
+    - 可直接发送到 WebSocket 的 JSON 字符串。
     """
 
     return make_message(
@@ -141,17 +140,14 @@ def encrypted_message(public_key: bytes, msg_type: str, client_id: str, payload:
 
 
 def decode_as_part(password: str, response: dict) -> dict:
-    """解开 AS_REP.payload.part。
+    """解密 AS_REP.payload.part。
 
-    输入：
-    - password：本次登录使用的明文密码。
-    - response：AS_REP 顶层对象。
+    参数:
+    - password: 当前登录密码，用于按 salt/iter 派生 Kuser。
+    - response: AS_REP 响应 dict。
 
-    输出：
-    - dict：part 明文，包含 nonce、kcTgs、exp、loginGen 等字段。
-
-    验证点：
-    - 客户端必须用 salt/iter 派生 Kuser，才能解开 part。
+    返回:
+    - part JSON dict，包含 nonce、kcTgs、exp、loginGen 等字段。
     """
 
     payload = json.loads(response["payload"])
@@ -161,21 +157,25 @@ def decode_as_part(password: str, response: dict) -> dict:
     return des_decrypt_object(kuser, payload["part"])
 
 
-async def login(ws, public_key: bytes, client_id: str, username: str, password: str, nonce: str) -> dict:
-    """完成一次 AS_REQ 登录并校验 nonce。
+async def login(
+    ws,
+    public_key: bytes,
+    client_id: str,
+    username: str,
+    password: str,
+    nonce: str,
+) -> dict:
+    """执行一次 AS_REQ 登录并校验 nonce。
 
-    输入：
-    - ws：WebSocket 连接。
-    - public_key：AS 公钥。
-    - client_id：客户端实例 ID。
-    - username / password：测试账号口令。
-    - nonce：客户端发出的随机串。
+    参数:
+    - ws: WebSocket 连接。
+    - public_key: AS RSA 公钥 PEM。
+    - client_id: 顶层 clientId。
+    - username/password: 登录凭据。
+    - nonce: 本次请求 nonce。
 
-    输出：
-    - dict：解密后的 AS_REP.payload.part。
-
-    异常：
-    - AssertionError：响应类型不是 AS_REP 或 nonce 不匹配。
+    返回:
+    - 解密后的 AS_REP.payload.part。
     """
 
     response = await request(
@@ -196,14 +196,11 @@ async def login(ws, public_key: bytes, client_id: str, username: str, password: 
 
 
 async def main() -> None:
-    """执行完整 AS 冒烟测试。
+    """执行完整 smoke test 流程。
 
-    流程：
-    1. 生成唯一测试用户名，避免与已有数据冲突。
-    2. 注册新账号。
-    3. 连续登录两次，确认 loginGen 递增。
-    4. 修改密码。
-    5. 验证旧密码失败，新密码成功。
+    数据库副作用:
+    - 新增一个随机用户名的 user_account。
+    - 写入 REGISTER、LOGIN_SUCCESS、LOGIN_FAIL、CHANGE_PASSWORD 安全事件。
     """
 
     public_key = load_public_key()

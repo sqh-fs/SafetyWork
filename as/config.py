@@ -1,34 +1,36 @@
-"""AS 服务配置读取模块。
+"""AS 认证服务器的环境变量配置读取模块。
 
-本文件只负责从环境变量读取运行配置，不连接数据库，也不启动网络服务。
+本文件只负责把环境变量整理成结构化配置对象，不连接数据库、不创建密钥、
+也不启动 WebSocket 服务。AS 两表化后，运行时长期密钥不再从 MySQL 的
+数据库读取，而是从环境变量或本地 PEM 文件读取。
 
-主要输入：
-- AUTH_DB_*：MySQL 连接参数。
-- AUTH_MASTER_KEY：Fernet 主密钥，用于解开 service_key 表里的密钥密文。
-- AS_* / TGS_*：AS 与 TGS 的监听地址、端口和服务名。
+主要输入:
+- AUTH_DB_HOST / AUTH_DB_PORT / AUTH_DB_USER / AUTH_DB_PASSWORD / AUTH_DB_NAME:
+  MySQL 连接参数。
+- AS_HOST / AS_PORT:
+  AS WebSocket 监听地址，默认 0.0.0.0:9000。
+- AS_RSA_PRIVATE_PEM / AS_RSA_PRIVATE_KEY_PATH:
+  AS RSA 私钥来源，二选一即可。
+- K_TGS_BASE64:
+  TGS 长期 DES 密钥的 Base64 文本，解码后必须正好是 8 字节。
 
-主要输出：
-- DbConfig：数据库连接配置。
-- AsConfig：AS 认证服务器运行配置。
-
-团队约定：
-- 配置缺失或格式错误时抛 ConfigError，让启动入口明确失败。
-- 本模块不保存任何敏感信息到文件，只读取当前进程环境变量。
+主要输出:
+- DbConfig: 数据库连接配置。
+- AsConfig: AS 协议、安全参数和密钥来源配置。
 """
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
+from typing import Optional
 
 
 class ConfigError(RuntimeError):
     """配置错误。
 
-    典型场景：
-    - 必填环境变量缺失，例如 AUTH_MASTER_KEY。
-    - 端口、迭代次数等整数环境变量无法解析。
-
-    输出方式：
-    - 由 as_server.py 捕获后打印启动失败原因。
+    典型触发场景:
+    - 必填环境变量缺失，例如 AUTH_DB_USER 或 AUTH_DB_NAME。
+    - 数值型环境变量无法转成整数。
+    - AS_HOST、AS_PORT 等启动参数不合法。
     """
 
     pass
@@ -38,13 +40,11 @@ class ConfigError(RuntimeError):
 class DbConfig:
     """MySQL 连接配置。
 
-    字段说明：
-    - host / port：数据库地址。
-    - user / password：AS 使用的数据库账号。
-    - database：认证库名称，默认 AuthDB。
-    - charset：字符集，固定 utf8mb4 以支持中文用户名快照和审计信息。
-
-    该对象只承载配置，不负责创建连接。
+    字段含义:
+    - host / port: MySQL 服务地址。
+    - user / password: 认证账号。
+    - database: AS 使用的认证库名称，需先执行 schema_auth.sql 初始化。
+    - charset: 连接字符集，固定使用 utf8mb4，避免用户名或审计原因出现中文时乱码。
     """
 
     host: str
@@ -57,135 +57,139 @@ class DbConfig:
 
 @dataclass(frozen=True)
 class AsConfig:
-    """AS 认证服务运行配置。
+    """AS 认证服务器运行配置。
 
-    字段说明：
-    - host / port：AS WebSocket 监听地址。
-    - realm：认证域，例如 GAME.LOCAL。
-    - as_service_name：AS 自己在 service_registry 中的服务名。
-    - tgs_service_name：TGS 在 service_registry 中的服务名，TGT 会绑定到它。
-    - tgt_ttl_seconds：TGT 默认有效期，单位秒。
-    - pbkdf2_iter：注册和改密时使用的 PBKDF2 迭代次数。
-    - auth_master_key：Fernet 主密钥，用于解密 service_key.key_ciphertext。
-    - as_key_version / tgs_key_version：当前启用的密钥版本号。
-    - tgs_host / tgs_port：种子脚本写入 TGS 服务注册信息时使用。
+    字段含义:
+    - host / port: WebSocket 监听地址。
+    - realm: 票据所属认证域，写入 TGT 明文字段后再被 K_TGS 加密。
+    - tgs_service_name: TGT 绑定的逻辑服务名，默认 krbtgt/{realm}。
+    - tgt_ttl_seconds: TGT 有效期秒数，默认 2 小时。
+    - pbkdf2_iter: 新注册/改密时写入 user_account.pbkdf2_iter 的迭代次数。
+    - as_private_key_pem: 直接来自 AS_RSA_PRIVATE_PEM 的私钥文本，可为空。
+    - as_private_key_path: 来自 AS_RSA_PRIVATE_KEY_PATH 的私钥文件路径，可为空。
+    - k_tgs_base64: 来自 K_TGS_BASE64 的 TGS 长期 DES 密钥文本。
     """
 
     host: str
     port: int
     realm: str
-    as_service_name: str
     tgs_service_name: str
     tgt_ttl_seconds: int
     pbkdf2_iter: int
-    auth_master_key: str
-    as_key_version: str
-    tgs_key_version: str
-    tgs_host: str
-    tgs_port: int
-
-
-def _env_int(name: str, default: int) -> int:
-    """读取整数环境变量。
-
-    输入：
-    - name：环境变量名。
-    - default：变量不存在或为空时使用的默认值。
-
-    输出：
-    - int：解析后的整数。
-
-    异常：
-    - ConfigError：变量存在但不是合法整数。
-    """
-
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ConfigError(f"{name} must be an integer") from exc
+    as_private_key_pem: Optional[str]
+    as_private_key_path: Optional[str]
+    k_tgs_base64: str
 
 
 def _required_env(name: str) -> str:
     """读取必填环境变量。
 
-    输入：
-    - name：环境变量名。
+    参数:
+    - name: 环境变量名。
 
-    输出：
-    - str：去掉首尾空白后的变量值。
+    返回:
+    - 去除首尾空白后的字符串值。
 
-    异常：
-    - ConfigError：变量不存在或为空。
+    异常:
+    - ConfigError: 变量不存在或值为空。
     """
 
     value = os.getenv(name)
     if value is None or value.strip() == "":
-        raise ConfigError(f"{name} is required")
+        raise ConfigError(f"missing required environment variable: {name}")
     return value.strip()
+
+
+def _optional_env(name: str) -> Optional[str]:
+    """读取可选环境变量。
+
+    参数:
+    - name: 环境变量名。
+
+    返回:
+    - 未设置或全空白时返回 None，否则返回去除首尾空白后的字符串。
+    """
+
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
+
+
+def _int_env(name: str, default: int) -> int:
+    """读取整数环境变量。
+
+    参数:
+    - name: 环境变量名。
+    - default: 未设置时使用的默认值。
+
+    返回:
+    - int 类型配置值。
+
+    异常:
+    - ConfigError: 变量已设置但不是合法整数。
+    """
+
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"environment variable {name} must be an integer") from exc
 
 
 def load_db_config() -> DbConfig:
     """加载 MySQL 连接配置。
 
-    输入：
-    - 当前进程环境变量 AUTH_DB_HOST、AUTH_DB_PORT、AUTH_DB_USER、
-      AUTH_DB_PASSWORD、AUTH_DB_NAME。
+    输入:
+    - AUTH_DB_HOST: 默认 127.0.0.1。
+    - AUTH_DB_PORT: 默认 3306。
+    - AUTH_DB_USER / AUTH_DB_NAME: 必填。
+    - AUTH_DB_PASSWORD: 可为空字符串。
 
-    输出：
-    - DbConfig：供 db.AuthDb 创建连接使用。
-
-    默认值：
-    - host=127.0.0.1
-    - port=3306
-    - user=as_rw
-    - database=AuthDB
+    输出:
+    - DbConfig，用于 db.py 创建 PyMySQL 连接。
     """
 
     return DbConfig(
-        host=os.getenv("AUTH_DB_HOST", "127.0.0.1").strip(),
-        port=_env_int("AUTH_DB_PORT", 3306),
-        user=os.getenv("AUTH_DB_USER", "as_rw").strip(),
+        host=os.getenv("AUTH_DB_HOST", "127.0.0.1").strip() or "127.0.0.1",
+        port=_int_env("AUTH_DB_PORT", 3306),
+        user=_required_env("AUTH_DB_USER"),
         password=os.getenv("AUTH_DB_PASSWORD", ""),
-        database=os.getenv("AUTH_DB_NAME", "AuthDB").strip(),
+        database=_required_env("AUTH_DB_NAME"),
     )
 
 
-def load_as_config(require_master_key: bool = True) -> AsConfig:
-    """加载 AS 服务配置。
+def load_as_config() -> AsConfig:
+    """加载 AS 协议和密钥来源配置。
 
-    输入：
-    - require_master_key：是否强制要求 AUTH_MASTER_KEY 存在。
-      as_server.py 和 seed_auth_keys.py 必须为 True；仅生成主密钥时可为 False。
+    输入:
+    - AS_HOST / AS_PORT: 监听配置。
+    - AUTH_REALM: 认证域，默认 SAFETYWORK。
+    - AUTH_TGS_SERVICE_NAME: TGS 逻辑服务名，默认 krbtgt/{realm}。
+    - AUTH_TGT_TTL_SECONDS: TGT 有效期，默认 7200 秒。
+    - AUTH_PBKDF2_ITER: PBKDF2 默认迭代次数，默认 100000。
+    - AS_RSA_PRIVATE_PEM 或 AS_RSA_PRIVATE_KEY_PATH: RSA 私钥来源。
+    - K_TGS_BASE64: TGS 长期 DES 密钥，必填。
 
-    输出：
-    - AsConfig：AS 启动、签发 TGT、加载密钥时使用的完整配置。
-
-    异常：
-    - ConfigError：必填项缺失或整数项解析失败。
+    输出:
+    - AsConfig。密钥内容的格式校验在 as_server.load_runtime_keys() 中完成。
     """
 
-    realm = os.getenv("AUTH_REALM", "GAME.LOCAL").strip()
-    master_key = (
-        _required_env("AUTH_MASTER_KEY")
-        if require_master_key
-        else os.getenv("AUTH_MASTER_KEY", "").strip()
+    realm = os.getenv("AUTH_REALM", "SAFETYWORK").strip() or "SAFETYWORK"
+    tgs_service_name = (
+        os.getenv("AUTH_TGS_SERVICE_NAME", f"krbtgt/{realm}").strip()
+        or f"krbtgt/{realm}"
     )
-
     return AsConfig(
-        host=os.getenv("AS_HOST", "0.0.0.0").strip(),
-        port=_env_int("AS_PORT", 9000),
+        host=os.getenv("AS_HOST", "0.0.0.0").strip() or "0.0.0.0",
+        port=_int_env("AS_PORT", 9000),
         realm=realm,
-        as_service_name=os.getenv("AUTH_AS_SERVICE_NAME", f"as/{realm}").strip(),
-        tgs_service_name=os.getenv("AUTH_TGS_SERVICE_NAME", f"krbtgt/{realm}").strip(),
-        tgt_ttl_seconds=_env_int("AUTH_TGT_TTL_SECONDS", 7200),
-        pbkdf2_iter=_env_int("AUTH_PBKDF2_ITER", 100000),
-        auth_master_key=master_key,
-        as_key_version=os.getenv("AUTH_AS_KEY_VERSION", "v1").strip(),
-        tgs_key_version=os.getenv("AUTH_TGS_KEY_VERSION", "v1").strip(),
-        tgs_host=os.getenv("TGS_HOST", "127.0.0.1").strip(),
-        tgs_port=_env_int("TGS_PORT", 9001),
+        tgs_service_name=tgs_service_name,
+        tgt_ttl_seconds=_int_env("AUTH_TGT_TTL_SECONDS", 7200),
+        pbkdf2_iter=_int_env("AUTH_PBKDF2_ITER", 100000),
+        as_private_key_pem=_optional_env("AS_RSA_PRIVATE_PEM"),
+        as_private_key_path=_optional_env("AS_RSA_PRIVATE_KEY_PATH"),
+        k_tgs_base64=_required_env("K_TGS_BASE64"),
     )

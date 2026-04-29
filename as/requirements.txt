@@ -1,11 +1,11 @@
-# AS WebSocket 服务端和 smoke 测试客户端。
+# AS WebSocket 服务和 smoke_test_as.py 客户端连接。
 websockets>=12.0
 
-# RSA-OAEP、Fernet 主密钥封装、PEM 密钥读写。
+# RSA-OAEP-SHA256、PEM 密钥读取和生成。
 cryptography>=42.0.0
 
-# DES-CBC-PKCS7。课程设计要求 DES，cryptography 新版本已弱化单 DES 支持。
+# DES-CBC-PKCS7。当前课程协议要求 DES，因此这里使用 pycryptodome。
 pycryptodome>=3.20.0
 
-# MySQL 访问层，db.py 使用 pymysql DictCursor。
+# MySQL 访问；db.py 使用 PyMySQL DictCursor 返回字典行。
 pymysql>=1.1.0
