@@ -1,114 +1,110 @@
-"""AS 认证数据库访问层。
+"""AS 认证服务器的数据访问层。
 
-本文件封装 MySQL 表访问，业务层通过 AuthDb 调用数据库，不直接写 SQL。
+两表化后，本模块只访问图片设计中的两张表:
+- user_account: 保存用户账号、PBKDF2 密码摘要、登录代数 login_gen 和状态。
+- security_event_log: 记录注册、登录、改密等安全事件。
 
-重要设计：
-- connection() 默认 autocommit=False，事务提交/回滚由调用方控制。
-- DAO 方法只执行 SQL，不决定业务成功失败的协议响应。
-- 所有时间使用 UTC naive datetime 写入 DATETIME(3)，避免本地时区影响审计。
-
-涉及表：
-- user_account：用户账号、密码摘要、PBKDF2 参数、loginGen。
-- service_registry：AS/TGS/GS 服务注册信息。
-- service_key：长期密钥密文。
-- login_audit：注册、登录、改密等审计记录。
-- ticket_issue_log：TGT 和后续 Service Ticket 签发日志。
+本模块不负责协议解析、密码学计算或 WebSocket 响应，只封装 SQL。调用者
+需要显式 commit 或 rollback，这样注册、登录、改密主流程可以把用户变更和
+安全事件写入放在同一个事务边界内。
 """
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterator, Optional
+
+from config import DbConfig
 
 try:
     import pymysql
     from pymysql.cursors import DictCursor
-except ImportError as exc:  # pragma: no cover - exercised only when deps are missing.
+except ImportError as exc:  # pragma: no cover - only hit when dependencies missing.
     pymysql = None
     DictCursor = None
     _PYMYSQL_IMPORT_ERROR = exc
 else:
     _PYMYSQL_IMPORT_ERROR = None
 
-from config import DbConfig
 
+class DatabaseError(RuntimeError):
+    """数据库访问错误。
 
-class DbError(RuntimeError):
-    """数据库访问层错误。
-
-    典型原因：
-    - pymysql 未安装。
-    - upsert 后查不到 service_id。
-    - 更新用户后查不到 login_gen。
+    典型场景:
+    - 未安装 pymysql。
+    - MySQL 无法连接。
+    - schema_auth.sql 尚未初始化。
     """
 
     pass
 
 
-def utc_now_naive() -> datetime:
-    """返回当前 UTC 时间。
+@dataclass(frozen=True)
+class SecurityEvent:
+    """security_event_log 的一条待写入事件。
 
-    输出：
-    - datetime：无时区对象，用于写入 MySQL DATETIME(3)。
+    参数:
+    - user_id: 已知用户的 user_account.user_id；用户不存在时允许为 None。
+    - username: 用户名快照，用于追踪登录失败或非法请求。
+    - event_type: REGISTER、LOGIN_SUCCESS、LOGIN_FAIL、CHANGE_PASSWORD 等。
+    - result: 1 表示成功，0 表示失败。
+    - client_id: 客户端运行期实例 ID，来自报文 clientId。
+    - remote_addr: WebSocket 远端地址，仅用于审计。
+    - reason: 失败原因或安全事件原因，例如 BAD_CREDENTIALS。
     """
 
-    return datetime.utcnow()
+    user_id: Optional[int]
+    username: Optional[str]
+    event_type: str
+    result: int
+    client_id: Optional[str]
+    remote_addr: Optional[str]
+    reason: Optional[str]
 
 
-class AuthDb:
-    """认证数据库访问对象。
+class AuthDao:
+    """认证库 DAO。
 
-    输入：
-    - DbConfig：数据库连接参数。
+    输入:
+    - DbConfig: MySQL 连接参数。
 
-    输出：
-    - 各方法返回 dict、int 或 None，具体含义见方法 docstring。
+    输出:
+    - connection(): 返回可用于事务操作的 PyMySQL 连接。
+    - 各方法返回 dict、int 或 None。
 
-    事务约定：
-    - connection() 打开的连接不自动提交。
-    - 调用方必须在业务成功后 conn.commit()，失败时 conn.rollback()。
-    - 这样注册、审计、票据日志可以和业务变更保持同一事务边界。
+    事务约定:
+    - 本类默认不自动 commit。
+    - 写方法执行 SQL 后由调用者决定 commit/rollback。
     """
 
     def __init__(self, config: DbConfig) -> None:
-        """保存数据库配置。
-
-        输入：
-        - config：MySQL 连接配置。
-        """
-
         self.config = config
 
-    def _require_pymysql(self) -> None:
-        """确认 pymysql 依赖可用。
+    def _ensure_driver(self) -> None:
+        """确认 pymysql 已安装。
 
-        输出：
-        - None：依赖存在时返回。
-
-        异常：
-        - DbError：依赖未安装，提示安装 as/requirements.txt。
+        异常:
+        - DatabaseError: as/requirements.txt 中的 pymysql 未安装。
         """
 
         if pymysql is None:
-            raise DbError(
-                "pymysql is required for MySQL support; install as/requirements.txt"
+            raise DatabaseError(
+                "pymysql is required; install dependencies from as/requirements.txt"
             ) from _PYMYSQL_IMPORT_ERROR
 
     @contextmanager
     def connection(self) -> Iterator[Any]:
-        """创建 MySQL 连接上下文。
+        """创建一个 MySQL 连接。
 
-        输入：
-        - 无，使用构造函数中的 DbConfig。
+        返回:
+        - PyMySQL connection，游标类型为 DictCursor，查询结果是字典。
 
-        输出：
-        - Iterator[Connection]：yield 一个 pymysql connection。
-
-        副作用：
-        - 打开数据库连接，退出上下文时关闭连接。
-        - 不自动 commit/rollback，事务由调用方控制。
+        副作用:
+        - 打开 TCP/MySQL 连接。
+        - 退出上下文时关闭连接，但不会替调用者自动提交事务。
         """
 
-        self._require_pymysql()
+        self._ensure_driver()
         conn = pymysql.connect(
             host=self.config.host,
             port=self.config.port,
@@ -116,8 +112,8 @@ class AuthDb:
             password=self.config.password,
             database=self.config.database,
             charset=self.config.charset,
-            cursorclass=DictCursor,
             autocommit=False,
+            cursorclass=DictCursor,
         )
         try:
             yield conn
@@ -125,223 +121,51 @@ class AuthDb:
             conn.close()
 
     def ping(self) -> None:
-        """检查数据库连接是否可用。
+        """检查数据库是否可连接。
 
-        输入：
-        - 无。
+        输入:
+        - DbConfig 中的 MySQL 参数。
 
-        输出：
-        - None：连接成功。
+        输出:
+        - None。连接成功后立即关闭。
 
-        副作用：
-        - 建立并关闭一次 MySQL 连接。
+        异常:
+        - DatabaseError 或 PyMySQL 原始异常。
         """
 
         with self.connection() as conn:
             conn.ping(reconnect=False)
 
-    def get_service(self, conn: Any, service_name: str) -> Optional[Dict[str, Any]]:
-        """查询启用状态的服务注册记录。
-
-        输入：
-        - conn：外部传入的事务连接。
-        - service_name：服务名，例如 as/GAME.LOCAL 或 krbtgt/GAME.LOCAL。
-
-        输出：
-        - dict：service_registry 行。
-        - None：服务不存在或未启用。
-
-        读取表：
-        - service_registry。
-        """
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM service_registry
-                WHERE service_name = %s AND status = 'ENABLED'
-                """,
-                (service_name,),
-            )
-            return cur.fetchone()
-
-    def upsert_service(
-        self,
-        conn: Any,
-        service_name: str,
-        service_type: str,
-        realm: str,
-        host: str,
-        port: int,
-        websocket_url: str,
-    ) -> int:
-        """插入或更新服务注册记录。
-
-        输入：
-        - conn：外部事务连接。
-        - service_name / service_type / realm / host / port / websocket_url：
-          服务注册字段。
-
-        输出：
-        - int：service_registry.service_id。
-
-        写入表：
-        - service_registry。
-
-        事务：
-        - 本方法不提交事务，由调用方 seed_auth_keys.py 统一 commit。
-        """
-
-        now = utc_now_naive()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO service_registry
-                    (service_name, service_type, realm, host, port, websocket_url,
-                     status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'ENABLED', %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    service_type = VALUES(service_type),
-                    realm = VALUES(realm),
-                    host = VALUES(host),
-                    port = VALUES(port),
-                    websocket_url = VALUES(websocket_url),
-                    status = 'ENABLED',
-                    updated_at = VALUES(updated_at)
-                """,
-                (service_name, service_type, realm, host, port, websocket_url, now, now),
-            )
-            cur.execute(
-                "SELECT service_id FROM service_registry WHERE service_name = %s",
-                (service_name,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise DbError("SERVICE_UPSERT_FAILED")
-            return int(row["service_id"])
-
-    def get_service_key(
-        self,
-        conn: Any,
-        service_name: str,
-        key_usage: str,
-        key_version: str,
-    ) -> Optional[Dict[str, Any]]:
-        """读取启用状态的服务密钥。
-
-        输入：
-        - conn：外部事务连接。
-        - service_name：服务名。
-        - key_usage：密钥用途，例如 AS_RSA_PRIVATE、AS_RSA_PUBLIC、K_TGS。
-        - key_version：密钥版本号，例如 v1。
-
-        输出：
-        - dict：service_key 与 service_registry join 后的记录。
-        - None：密钥不存在、未启用或服务未启用。
-
-        读取表：
-        - service_key。
-        - service_registry。
-        """
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT sk.*, sr.service_name, sr.service_type
-                FROM service_key sk
-                JOIN service_registry sr ON sr.service_id = sk.service_id
-                WHERE sr.service_name = %s
-                  AND sk.key_usage = %s
-                  AND sk.key_version = %s
-                  AND sk.enabled = 1
-                  AND sr.status = 'ENABLED'
-                """,
-                (service_name, key_usage, key_version),
-            )
-            return cur.fetchone()
-
-    def upsert_service_key(
-        self,
-        conn: Any,
-        service_id: int,
-        key_usage: str,
-        key_version: str,
-        algorithm: str,
-        key_ciphertext: bytes,
-    ) -> None:
-        """插入或更新某个服务的密钥密文。
-
-        输入：
-        - service_id：service_registry 主键。
-        - key_usage：密钥用途。
-        - key_version：版本号。
-        - algorithm：算法名，例如 RSA 或 DES。
-        - key_ciphertext：Fernet 加密后的密钥材料。
-
-        输出：
-        - None。
-
-        写入表：
-        - service_key。
-
-        事务：
-        - 不提交事务，由调用方统一提交。
-        """
-
-        now = utc_now_naive()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO service_key
-                    (service_id, key_usage, key_version, algorithm, key_ciphertext,
-                     enabled, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, 1, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    algorithm = VALUES(algorithm),
-                    key_ciphertext = VALUES(key_ciphertext),
-                    enabled = 1,
-                    updated_at = VALUES(updated_at)
-                """,
-                (
-                    service_id,
-                    key_usage,
-                    key_version,
-                    algorithm,
-                    key_ciphertext,
-                    now,
-                    now,
-                ),
-            )
-
     def find_user(
         self,
         conn: Any,
         username: str,
+        *,
         for_update: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """按用户名查询用户账号。
+        """按规范化用户名查询 user_account。
 
-        输入：
-        - conn：外部事务连接。
-        - username：已经 normalize 后的小写用户名。
-        - for_update：是否追加 SELECT ... FOR UPDATE 锁定该用户行。
+        参数:
+        - conn: 外部传入的事务连接。
+        - username: 已经 trim + lower 的用户名。
+        - for_update: True 时追加 FOR UPDATE，用于登录/改密时锁定 login_gen。
 
-        输出：
-        - dict：user_account 行。
-        - None：用户不存在。
+        返回:
+        - 找到时返回 user_account 行字典。
+        - 不存在时返回 None。
 
-        读取表：
-        - user_account。
-
-        使用场景：
-        - 登录和改密需要 for_update=True，防止并发修改 loginGen 或密码。
+        数据库副作用:
+        - 只读查询；for_update=True 时会在当前事务内加行锁。
         """
 
-        sql = "SELECT * FROM user_account WHERE username = %s"
+        sql = """
+            SELECT user_id, username, password_hash, password_salt, pbkdf2_iter,
+                   login_gen, status, last_login_at, created_at, updated_at
+            FROM user_account
+            WHERE username = %s
+        """
         if for_update:
             sql += " FOR UPDATE"
-
         with conn.cursor() as cur:
             cur.execute(sql, (username,))
             return cur.fetchone()
@@ -349,111 +173,105 @@ class AuthDb:
     def create_user(
         self,
         conn: Any,
+        *,
         username: str,
         password_hash: bytes,
         password_salt: bytes,
         pbkdf2_iter: int,
     ) -> int:
-        """创建新用户账号。
+        """创建用户账号。
 
-        输入：
-        - username：规范化后的用户名。
-        - password_hash：PBKDF2 32 字节摘要。
-        - password_salt：随机盐。
-        - pbkdf2_iter：PBKDF2 迭代次数。
+        参数:
+        - username: 已规范化用户名，写入 user_account.username。
+        - password_hash: PBKDF2-HMAC-SHA256 派生出的 32 字节密码摘要。
+        - password_salt: PBKDF2 salt。
+        - pbkdf2_iter: PBKDF2 迭代次数。
 
-        输出：
-        - int：新建用户的 user_id。
+        返回:
+        - 新用户的 user_id。
 
-        写入表：
-        - user_account。
+        数据库副作用:
+        - INSERT user_account。
+        - status、login_gen、created_at、updated_at 使用表默认值。
 
-        事务：
-        - 不提交事务，注册成功时由 as_server.py 同时提交用户和审计记录。
+        异常:
+        - 用户名唯一索引冲突时抛出 PyMySQL IntegrityError，由调用者转换成
+          USERNAME_EXISTS。
         """
 
-        now = utc_now_naive()
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO user_account
-                    (username, password_hash, password_salt, password_algo,
-                     pbkdf2_iter, login_gen, status, created_at, updated_at)
-                VALUES (%s, %s, %s, 'PBKDF2', %s, 0, 'ACTIVE', %s, %s)
+                    (username, password_hash, password_salt, pbkdf2_iter)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (username, password_hash, password_salt, pbkdf2_iter, now, now),
+                (username, password_hash, password_salt, pbkdf2_iter),
             )
             return int(cur.lastrowid)
 
-    def increment_login_gen_for_login(
-        self,
-        conn: Any,
-        user_id: int,
-        client_id: str,
-    ) -> int:
-        """登录成功后递增 loginGen。
+    def increment_login_gen_for_login(self, conn: Any, *, user_id: int) -> int:
+        """登录成功后递增 login_gen 并记录最近登录时间。
 
-        输入：
-        - user_id：用户主键。
-        - client_id：本次客户端实例 ID。
+        参数:
+        - conn: 外部事务连接。
+        - user_id: user_account 主键。
 
-        输出：
-        - int：递增后的 login_gen。
+        返回:
+        - 递增后的 login_gen。
 
-        写入表：
-        - user_account.login_gen、last_client_id、last_login_at、updated_at。
-
-        作用：
-        - 让旧 TGT、旧 Service Ticket 和旧 GS 会话在后续校验 loginGen 时失效。
+        数据库副作用:
+        - UPDATE user_account.login_gen = login_gen + 1。
+        - UPDATE user_account.last_login_at = 当前 UTC 时间。
+        - updated_at 由表的 ON UPDATE CURRENT_TIMESTAMP(3) 自动刷新。
         """
 
-        now = utc_now_naive()
+        now = datetime.utcnow()
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE user_account
                 SET login_gen = login_gen + 1,
-                    last_client_id = %s,
-                    last_login_at = %s,
-                    updated_at = %s
+                    last_login_at = %s
                 WHERE user_id = %s
                 """,
-                (client_id, now, now, user_id),
+                (now, user_id),
             )
             cur.execute(
                 "SELECT login_gen FROM user_account WHERE user_id = %s",
                 (user_id,),
             )
             row = cur.fetchone()
-            if row is None:
-                raise DbError("USER_NOT_FOUND")
-            return int(row["login_gen"])
+        if row is None:
+            raise DatabaseError("user disappeared while incrementing login_gen")
+        return int(row["login_gen"])
 
     def update_password_and_increment_login_gen(
         self,
         conn: Any,
+        *,
         user_id: int,
         password_hash: bytes,
         password_salt: bytes,
         pbkdf2_iter: int,
     ) -> int:
-        """更新用户密码并递增 loginGen。
+        """改密成功后更新密码材料并递增 login_gen。
 
-        输入：
-        - user_id：用户主键。
-        - password_hash / password_salt / pbkdf2_iter：新密码派生结果和参数。
+        参数:
+        - user_id: user_account 主键。
+        - password_hash/password_salt/pbkdf2_iter: 新密码的 PBKDF2 材料。
 
-        输出：
-        - int：递增后的 login_gen。
+        返回:
+        - 递增后的 login_gen。
 
-        写入表：
-        - user_account.password_hash、password_salt、pbkdf2_iter、login_gen、updated_at。
-
-        作用：
-        - 改密成功后强制旧票据和旧业务会话失效。
+        数据库副作用:
+        - UPDATE user_account.password_hash。
+        - UPDATE user_account.password_salt。
+        - UPDATE user_account.pbkdf2_iter。
+        - UPDATE user_account.login_gen = login_gen + 1。
+        - updated_at 自动刷新。
         """
 
-        now = utc_now_naive()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -461,122 +279,110 @@ class AuthDb:
                 SET password_hash = %s,
                     password_salt = %s,
                     pbkdf2_iter = %s,
-                    login_gen = login_gen + 1,
-                    updated_at = %s
+                    login_gen = login_gen + 1
                 WHERE user_id = %s
                 """,
-                (password_hash, password_salt, pbkdf2_iter, now, user_id),
+                (password_hash, password_salt, pbkdf2_iter, user_id),
             )
             cur.execute(
                 "SELECT login_gen FROM user_account WHERE user_id = %s",
                 (user_id,),
             )
             row = cur.fetchone()
-            if row is None:
-                raise DbError("USER_NOT_FOUND")
-            return int(row["login_gen"])
+        if row is None:
+            raise DatabaseError("user disappeared while updating password")
+        return int(row["login_gen"])
 
-    def record_audit(
+    def record_security_event(
         self,
         conn: Any,
+        *,
         user_id: Optional[int],
         username: Optional[str],
-        client_id: Optional[str],
         event_type: str,
-        success: bool,
-        error_code: Optional[str],
-        login_gen_after: Optional[int],
-        ip_addr: Optional[str],
+        result: bool,
+        client_id: Optional[str],
+        remote_addr: Optional[str],
+        reason: Optional[str],
     ) -> None:
-        """写入登录与安全审计日志。
+        """写入 security_event_log。
 
-        输入：
-        - user_id：关联用户，登录失败且用户不存在时为 None。
-        - username：事件发生时提交的用户名快照。
-        - client_id：客户端实例 ID。
-        - event_type：REGISTER、LOGIN_SUCCESS、LOGIN_FAILED、CHANGE_PASSWORD 等。
-        - success：本次安全事件是否成功。
-        - error_code：失败时的机器可读错误码。
-        - login_gen_after：事件发生后的 loginGen，未知时为 None。
-        - ip_addr：客户端 IP。
+        参数:
+        - user_id: 可为空。用户名不存在、非法请求等场景没有可关联用户。
+        - username: 用户名快照，可为空。
+        - event_type: REGISTER、LOGIN_SUCCESS、LOGIN_FAIL、CHANGE_PASSWORD、
+          TICKET_EXPIRED、REPLAY_BLOCKED 等机器可读类型。
+        - result: True 写 1，False 写 0。
+        - client_id: 报文 clientId，超过 64 字符会截断以匹配表字段。
+        - remote_addr: WebSocket 远端地址，超过 128 字符会截断。
+        - reason: 失败原因或安全原因，超过 128 字符会截断。
 
-        输出：
+        返回:
         - None。
 
-        写入表：
-        - login_audit。
+        数据库副作用:
+        - INSERT security_event_log。
+        - 不自动提交事务。
         """
 
+        event = SecurityEvent(
+            user_id=user_id,
+            username=_truncate(username, 64),
+            event_type=_truncate(event_type, 32) or event_type,
+            result=1 if result else 0,
+            client_id=_truncate(client_id, 64),
+            remote_addr=_truncate(remote_addr, 128),
+            reason=_truncate(reason, 128),
+        )
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO login_audit
-                    (user_id, username_snapshot, client_id, event_type, success,
-                     error_code, ip_addr, login_gen_after, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO security_event_log
+                    (user_id, username, event_type, result,
+                     client_id, remote_addr, reason)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    user_id,
-                    username,
-                    client_id,
-                    event_type,
-                    1 if success else 0,
-                    error_code,
-                    ip_addr,
-                    login_gen_after,
-                    utc_now_naive(),
+                    event.user_id,
+                    event.username,
+                    event.event_type,
+                    event.result,
+                    event.client_id,
+                    event.remote_addr,
+                    event.reason,
                 ),
             )
 
-    def record_ticket_issue(
-        self,
-        conn: Any,
-        user_id: int,
-        client_id: str,
-        ticket_type: str,
-        service_id: int,
-        ticket_hash_value: str,
-        login_gen: int,
-        issued_at: datetime,
-        expire_at: datetime,
-    ) -> None:
-        """记录票据签发日志。
+    def is_duplicate_username_error(self, exc: BaseException) -> bool:
+        """判断异常是否来自用户名唯一索引冲突。
 
-        输入：
-        - user_id / client_id：票据归属。
-        - ticket_type：当前 AS 只写 TGT，后续 TGS 可写 SERVICE_TICKET。
-        - service_id：票据目标服务，本轮 TGT 绑定 TGS 服务。
-        - ticket_hash_value：票据密文 SHA-256 摘要。
-        - login_gen：票据绑定的登录代数。
-        - issued_at / expire_at：签发和过期时间。
+        参数:
+        - exc: PyMySQL 抛出的异常对象。
 
-        输出：
-        - None。
-
-        写入表：
-        - ticket_issue_log。
-
-        注意：
-        - 这里只保存票据密文摘要，不保存明文票据内容。
+        返回:
+        - True: MySQL 错误码 1062，且通常表示 uk_user_account_username 冲突。
+        - False: 其他数据库错误。
         """
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ticket_issue_log
-                    (user_id, client_id, ticket_type, service_id, ticket_hash,
-                     login_gen, issued_at, expire_at, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ISSUED', %s)
-                """,
-                (
-                    user_id,
-                    client_id,
-                    ticket_type,
-                    service_id,
-                    ticket_hash_value,
-                    login_gen,
-                    issued_at,
-                    expire_at,
-                    utc_now_naive(),
-                ),
-            )
+        if pymysql is None:
+            return False
+        integrity_error = getattr(pymysql, "err").IntegrityError
+        if not isinstance(exc, integrity_error):
+            return False
+        return bool(getattr(exc, "args", None)) and exc.args[0] == 1062
+
+
+def _truncate(value: Optional[str], limit: int) -> Optional[str]:
+    """把审计文本截断到表字段允许长度。
+
+    参数:
+    - value: 原始文本，可为空。
+    - limit: 最大字符数。
+
+    返回:
+    - None 或截断后的字符串。
+    """
+
+    if value is None:
+        return None
+    return value[:limit]

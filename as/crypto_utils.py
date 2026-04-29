@@ -1,20 +1,13 @@
-"""AS 认证链路使用的加密与编码工具。
+"""AS 认证服务器使用的密码学工具函数。
 
-本文件集中实现安全相关的基础操作，避免业务代码里散落加密细节。
+本文件集中实现协议中用到的基础密码学操作:
+- RSA-OAEP-SHA256: 客户端用 AS 公钥加密敏感 payload，AS 用私钥解密。
+- DES-CBC-PKCS7: AS 用 K_TGS 加密 TGT，用 Kuser 加密 AS_REP.payload.part。
+- PBKDF2-HMAC-SHA256: 从用户密码和 salt 派生密码摘要，同时取前 8 字节作为 Kuser。
+- 随机数生成: 生成 salt、KcTgs、K_TGS 和 nonce。
 
-协议中的主要加密关系：
-- REGISTER_REQ / AS_REQ / CHANGE_PASSWORD_REQ：
-  客户端使用 AS 公钥做 RSA-OAEP-SHA256 加密，AS 用私钥解密。
-- TGT：
-  AS 使用 K_TGS 做 DES-CBC-PKCS7 加密，客户端只保存和转发，TGS 才能解开。
-- AS_REP.payload.part：
-  AS 使用 Kuser 做 DES-CBC-PKCS7 加密，客户端用密码派生出的 Kuser 解开。
-- service_key.key_ciphertext：
-  种子脚本用 AUTH_MASTER_KEY 的 Fernet 加密长期密钥，AS 启动时解开。
-
-注意：
-- DES 只用于课程 Kerberos 设计要求，真实生产环境不建议使用 DES。
-- 本模块不读写数据库，也不处理 WebSocket。
+两表化后，长期密钥由 as_server.py 从 AS_RSA_PRIVATE_PEM /
+AS_RSA_PRIVATE_KEY_PATH 和 K_TGS_BASE64 加载。
 """
 
 import base64
@@ -26,7 +19,6 @@ import re
 import secrets
 from typing import Any, Dict, Tuple
 
-from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -50,45 +42,45 @@ PASSWORD_MIN_LENGTH = 8
 
 
 class CryptoError(RuntimeError):
-    """加密或编码失败。
+    """密码学处理错误。
 
-    输出方式：
-    - as_server.py 会把该错误转换成 ERROR 报文。
+    典型场景:
+    - Base64 输入非法。
+    - RSA 解密失败。
+    - DES 密钥长度不是 8 字节。
+    - DES padding 或密文格式非法。
 
-    常见原因：
-    - Base64 格式错误。
-    - RSA / DES 解密失败。
-    - DES key 长度不是 8 字节。
-    - AUTH_MASTER_KEY 不能解开数据库中的密钥密文。
+    输出:
+    - as_server.py 会把错误码转换为 ERROR 报文。
     """
 
     pass
 
 
 def b64encode(raw: bytes) -> str:
-    """把二进制数据编码成 Base64 字符串。
+    """把字节串编码为 Base64 文本。
 
-    输入：
-    - raw：原始字节。
+    参数:
+    - raw: 原始字节。
 
-    输出：
-    - str：ASCII Base64 文本，适合放进 JSON 字段。
+    返回:
+    - ASCII Base64 字符串，适合放进 JSON 字段。
     """
 
     return base64.b64encode(raw).decode("ascii")
 
 
 def b64decode(value: str) -> bytes:
-    """把 Base64 字符串解码成字节。
+    """把 Base64 文本解码为字节串。
 
-    输入：
-    - value：Base64 文本。
+    参数:
+    - value: Base64 字符串。
 
-    输出：
-    - bytes：解码后的原始字节。
+    返回:
+    - 解码后的 bytes。
 
-    异常：
-    - CryptoError("INVALID_BASE64")：输入不是合法 Base64。
+    异常:
+    - CryptoError("INVALID_BASE64"): 输入不是合法 Base64。
     """
 
     try:
@@ -98,50 +90,52 @@ def b64decode(value: str) -> bytes:
 
 
 def generate_nonce() -> str:
-    """生成认证器使用的随机串。
+    """生成协议 nonce。
 
-    输出：
-    - str：URL 安全随机字符串。
+    返回:
+    - URL 安全的随机字符串。
 
-    当前 AS 实现暂不主动生成 nonce，但测试或后续 TGS/GS 可复用。
+    用途:
+    - 客户端可在 AS_REQ 中携带 nonce，AS 在 part 中原样返回，用于确认响应
+      对应本次请求。
     """
 
     return secrets.token_urlsafe(18)
 
 
 def generate_des_key() -> bytes:
-    """生成 8 字节 DES 会话密钥。
+    """生成 8 字节 DES key。
 
-    输出：
-    - bytes：长度固定为 8 的随机 key。
+    返回:
+    - bytes，长度固定为 8。
 
-    用途：
-    - AS 登录成功后生成 KcTgs。
-    - 种子脚本生成长期 K_TGS。
+    用途:
+    - 生成 KcTgs。
+    - seed_auth_keys.py 生成 K_TGS。
     """
 
     return os.urandom(DES_KEY_BYTES)
 
 
 def generate_salt() -> bytes:
-    """生成 PBKDF2 密码盐。
+    """生成 PBKDF2 salt。
 
-    输出：
-    - bytes：长度固定为 16 的随机 salt。
+    返回:
+    - bytes，默认 16 字节，写入 user_account.password_salt。
     """
 
     return os.urandom(PASSWORD_SALT_BYTES)
 
 
 def validate_password_policy(password: str) -> bool:
-    """校验注册和改密的密码复杂度。
+    """校验密码强度策略。
 
-    输入：
-    - password：用户提交的明文密码。调用前已通过 RSA 加密保护传输。
+    参数:
+    - password: 客户端提交的明文密码，只在内存中短暂存在。
 
-    输出：
-    - True：至少 8 位，包含大写字母、小写字母和数字。
-    - False：不满足规则。
+    返回:
+    - True: 至少 8 位，且包含大写字母、小写字母和数字。
+    - False: 不满足策略。
     """
 
     if len(password) < PASSWORD_MIN_LENGTH:
@@ -158,33 +152,33 @@ def validate_password_policy(password: str) -> bool:
 def normalize_username(username: str) -> str:
     """规范化用户名。
 
-    输入：
-    - username：用户输入的登录名。
+    参数:
+    - username: 用户输入的用户名。
 
-    输出：
-    - str：去掉首尾空白并转小写后的用户名。
+    返回:
+    - trim + lower 后的用户名。
 
-    作用：
-    - 保证 LinHai、linhai、 LINHAI 不会注册成多个账号。
+    作用:
+    - 确保 LinHai、linhai、LINHAI 被视为同一个账号。
     """
 
     return username.strip().lower()
 
 
 def derive_password_material(password: str, salt: bytes, iterations: int) -> bytes:
-    """用 PBKDF2-HMAC-SHA256 派生密码材料。
+    """使用 PBKDF2-HMAC-SHA256 派生密码摘要。
 
-    输入：
-    - password：用户明文密码。
-    - salt：用户专属随机盐，来自 user_account.password_salt。
-    - iterations：PBKDF2 迭代次数，来自配置或数据库。
+    参数:
+    - password: 明文密码。
+    - salt: user_account.password_salt。
+    - iterations: user_account.pbkdf2_iter。
 
-    输出：
-    - bytes：32 字节派生结果。
+    返回:
+    - 32 字节派生结果。
 
-    用途：
-    - 完整 32 字节写入 password_hash，用于登录校验。
-    - 前 8 字节作为 Kuser，用于解开 AS_REP.payload.part。
+    用途:
+    - 完整 32 字节写入 user_account.password_hash。
+    - 前 8 字节作为 Kuser，用于加密 AS_REP.payload.part。
     """
 
     return hashlib.pbkdf2_hmac(
@@ -197,17 +191,17 @@ def derive_password_material(password: str, salt: bytes, iterations: int) -> byt
 
 
 def derive_kuser(password: str, salt: bytes, iterations: int) -> bytes:
-    """派生客户端和 AS 共享的 Kuser。
+    """从用户密码派生 Kuser。
 
-    输入：
-    - password、salt、iterations：与 derive_password_material 相同。
+    参数:
+    - password/salt/iterations: 与 derive_password_material 相同。
 
-    输出：
-    - bytes：派生结果前 8 字节，作为 DES key。
+    返回:
+    - 8 字节 DES key。
 
-    作用：
-    - AS 用 Kuser 加密 AS_REP.payload.part。
-    - 客户端用相同规则从密码派生 Kuser 后解密 part。
+    作用:
+    - AS 用 Kuser 加密 part。
+    - 客户端使用自己的密码同样派生 Kuser 后解密 part。
     """
 
     return derive_password_material(password, salt, iterations)[:DES_KEY_BYTES]
@@ -219,18 +213,19 @@ def verify_password_hash(
     iterations: int,
     expected_hash: bytes,
 ) -> bool:
-    """校验用户提交的密码是否匹配数据库摘要。
+    """校验密码是否匹配数据库摘要。
 
-    输入：
-    - password：用户提交的明文密码。
-    - salt / iterations：数据库保存的 PBKDF2 参数。
-    - expected_hash：数据库保存的 password_hash。
+    参数:
+    - password: 客户端提交的明文密码。
+    - salt / iterations: user_account 中保存的 PBKDF2 参数。
+    - expected_hash: user_account.password_hash。
 
-    输出：
-    - bool：True 表示密码正确。
+    返回:
+    - True: 密码正确。
+    - False: 密码错误。
 
-    安全点：
-    - 使用 hmac.compare_digest 做常量时间比较，降低计时侧信道风险。
+    安全点:
+    - 使用 hmac.compare_digest，避免普通字符串比较带来的时序差异。
     """
 
     actual = derive_password_material(password, salt, iterations)
@@ -238,13 +233,17 @@ def verify_password_hash(
 
 
 def _json_bytes(obj: Dict[str, Any]) -> bytes:
-    """把要加密的 JSON 对象编码成 UTF-8 字节。"""
+    """把 JSON 对象稳定序列化成 UTF-8 字节。"""
 
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _json_object(raw: bytes) -> Dict[str, Any]:
-    """把解密后的 UTF-8 JSON 字节解析成对象。"""
+    """把 UTF-8 JSON 字节解析成 dict。
+
+    异常:
+    - CryptoError("INVALID_JSON_PLAINTEXT"): 解密结果不是合法 JSON 对象。
+    """
 
     try:
         obj = json.loads(raw.decode("utf-8"))
@@ -253,7 +252,6 @@ def _json_object(raw: bytes) -> Dict[str, Any]:
 
     if not isinstance(obj, dict):
         raise CryptoError("INVALID_JSON_PLAINTEXT")
-
     return obj
 
 
@@ -267,18 +265,18 @@ def _require_des() -> None:
 
 
 def des_encrypt_object(key: bytes, obj: Dict[str, Any]) -> str:
-    """使用 DES-CBC-PKCS7 加密 JSON 对象。
+    """用 DES-CBC-PKCS7 加密 JSON 对象。
 
-    输入：
-    - key：8 字节 DES key，例如 K_TGS、Kuser、KcTgs。
-    - obj：要保护的明文 JSON 对象。
+    参数:
+    - key: 8 字节 DES key，例如 K_TGS、Kuser 或 KcTgs。
+    - obj: 要加密的 JSON 对象。
 
-    输出：
-    - str：Base64(iv + ciphertext)。
+    返回:
+    - Base64(iv + ciphertext)。
 
-    协议约定：
-    - IV 每次随机生成，长度 8 字节。
-    - 明文使用 PKCS7 padding 补齐 DES 块大小。
+    安全点:
+    - 每次加密都随机生成 8 字节 IV。
+    - 明文先做 PKCS7 padding 再进入 DES-CBC。
     """
 
     _require_des()
@@ -292,18 +290,19 @@ def des_encrypt_object(key: bytes, obj: Dict[str, Any]) -> str:
 
 
 def des_decrypt_object(key: bytes, ciphertext_b64: str) -> Dict[str, Any]:
-    """解密 DES-CBC-PKCS7 保护的 JSON 对象。
+    """解密 DES-CBC-PKCS7 加密的 JSON 对象。
 
-    输入：
-    - key：8 字节 DES key。
-    - ciphertext_b64：Base64(iv + ciphertext)。
+    参数:
+    - key: 8 字节 DES key。
+    - ciphertext_b64: Base64(iv + ciphertext)。
 
-    输出：
-    - dict：解密并解析后的明文 JSON 对象。
+    返回:
+    - 解密后的 JSON dict。
 
-    异常：
-    - INVALID_DES_KEY_LENGTH：key 长度不是 8 字节。
-    - INVALID_DES_CIPHERTEXT / INVALID_DES_PADDING：密文格式或 padding 错误。
+    异常:
+    - INVALID_DES_KEY_LENGTH: key 不是 8 字节。
+    - INVALID_DES_CIPHERTEXT: 密文太短。
+    - INVALID_DES_PADDING: padding 校验失败。
     """
 
     _require_des()
@@ -325,14 +324,13 @@ def des_decrypt_object(key: bytes, ciphertext_b64: str) -> Dict[str, Any]:
 
 
 def generate_rsa_key_pair() -> Tuple[bytes, bytes]:
-    """生成 AS 使用的 RSA 密钥对。
+    """生成 AS RSA 密钥对。
 
-    输出：
-    - (private_pem, public_pem)：PEM 格式字节串。
+    返回:
+    - (private_pem, public_pem)，均为 PEM 字节串。
 
-    用途：
-    - seed_auth_keys.py 写入数据库 service_key。
-    - public_pem 同时导出为 as_public_key.pem 给客户端加密请求。
+    用途:
+    - seed_auth_keys.py 生成本地 AS 私钥和客户端可用的 AS 公钥。
     """
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -349,48 +347,51 @@ def generate_rsa_key_pair() -> Tuple[bytes, bytes]:
 
 
 def rsa_encrypt_object(public_pem: bytes, obj: Dict[str, Any]) -> str:
-    """使用 AS 公钥加密 JSON 对象。
+    """用 AS RSA 公钥加密 JSON 对象。
 
-    输入：
-    - public_pem：AS RSA 公钥 PEM。
-    - obj：要加密的请求材料，例如 username/password/nonce。
+    参数:
+    - public_pem: AS RSA 公钥 PEM。
+    - obj: 要发送给 AS 的敏感 payload。
 
-    输出：
-    - str：Base64(RSA-OAEP-SHA256密文)。
+    返回:
+    - Base64(RSA-OAEP-SHA256(ciphertext))。
 
-    典型调用方：
-    - Unity 客户端。
-    - smoke_test_as.py。
+    用途:
+    - 客户端或 smoke_test_as.py 生成 REGISTER_REQ / AS_REQ /
+      CHANGE_PASSWORD_REQ 的 payload。
     """
 
-    public_key = serialization.load_pem_public_key(public_pem)
-    ciphertext = public_key.encrypt(
-        _json_bytes(obj),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
+    try:
+        public_key = serialization.load_pem_public_key(public_pem)
+        ciphertext = public_key.encrypt(
+            _json_bytes(obj),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    except Exception as exc:
+        raise CryptoError("RSA_ENCRYPT_FAILED") from exc
     return b64encode(ciphertext)
 
 
 def rsa_decrypt_object(private_pem: bytes, ciphertext_b64: str) -> Dict[str, Any]:
-    """使用 AS 私钥解密客户端敏感 payload。
+    """用 AS RSA 私钥解密客户端 payload。
 
-    输入：
-    - private_pem：AS RSA 私钥 PEM。
-    - ciphertext_b64：Base64(RSA-OAEP-SHA256密文)。
+    参数:
+    - private_pem: AS RSA 私钥 PEM。
+    - ciphertext_b64: Base64(RSA-OAEP-SHA256(ciphertext))。
 
-    输出：
-    - dict：解密得到的 JSON 对象。
+    返回:
+    - 解密后的 JSON dict。
 
-    异常：
-    - RSA_DECRYPT_FAILED：密文不是用匹配公钥生成，或密文被篡改。
+    异常:
+    - RSA_DECRYPT_FAILED: 私钥格式错误、密文不匹配或 OAEP 校验失败。
     """
 
-    private_key = serialization.load_pem_private_key(private_pem, password=None)
     try:
+        private_key = serialization.load_pem_private_key(private_pem, password=None)
         plaintext = private_key.decrypt(
             b64decode(ciphertext_b64),
             padding.OAEP(
@@ -399,66 +400,8 @@ def rsa_decrypt_object(private_pem: bytes, ciphertext_b64: str) -> Dict[str, Any
                 label=None,
             ),
         )
+    except CryptoError:
+        raise
     except Exception as exc:
         raise CryptoError("RSA_DECRYPT_FAILED") from exc
     return _json_object(plaintext)
-
-
-def encrypt_key_material(master_key: str, plaintext: bytes) -> bytes:
-    """用 Fernet 主密钥加密长期服务密钥。
-
-    输入：
-    - master_key：AUTH_MASTER_KEY，Fernet Base64 key。
-    - plaintext：明文密钥材料，例如 RSA PEM 或 8 字节 K_TGS。
-
-    输出：
-    - bytes：写入 service_key.key_ciphertext 的密文。
-    """
-
-    return Fernet(master_key.encode("ascii")).encrypt(plaintext)
-
-
-def decrypt_key_material(master_key: str, ciphertext: bytes) -> bytes:
-    """解开 service_key 表中的长期密钥密文。
-
-    输入：
-    - master_key：AUTH_MASTER_KEY。
-    - ciphertext：数据库 service_key.key_ciphertext 字段。
-
-    输出：
-    - bytes：明文密钥材料。
-
-    异常：
-    - KEY_DECRYPT_FAILED：主密钥错误、密文损坏或版本不匹配。
-    """
-
-    try:
-        return Fernet(master_key.encode("ascii")).decrypt(ciphertext)
-    except Exception as exc:
-        raise CryptoError("KEY_DECRYPT_FAILED") from exc
-
-
-def generate_master_key() -> str:
-    """生成新的 Fernet 主密钥。
-
-    输出：
-    - str：可直接设置为 AUTH_MASTER_KEY 的字符串。
-    """
-
-    return Fernet.generate_key().decode("ascii")
-
-
-def ticket_hash(ticket: str) -> str:
-    """计算票据密文的 SHA-256 摘要。
-
-    输入：
-    - ticket：Base64 票据密文字符串。
-
-    输出：
-    - str：64 位十六进制摘要。
-
-    用途：
-    - 写入 ticket_issue_log.ticket_hash，便于审计且避免保存明文票据。
-    """
-
-    return hashlib.sha256(ticket.encode("utf-8")).hexdigest()
